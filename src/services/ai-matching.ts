@@ -1,0 +1,197 @@
+import { query } from '../db/pool';
+import { synthesizeDecision, SynthesisInput } from '../ai/decisionSynthesizer';
+
+interface Task {
+  id: number;
+  title: string;
+  description: string;
+  required_skills: string[];
+  task_location: string;
+  location_latitude: number;
+  location_longitude: number;
+  amount_naira: number;
+  due_date: string;
+}
+
+interface Worker {
+  id: number;
+  name: string;
+  skills: string[];
+  primary_location: string;
+  latitude: number;
+  longitude: number;
+  avg_rating: number;
+  trust_score: number;
+  tasks_completed: number;
+}
+
+interface MatchResult {
+  worker_id: number;
+  name: string;
+  match_score: number;
+  reasons: string[];
+  distance_km: number;
+}
+
+function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371; // Earth's radius in km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+async function getWorkerMatches(task: Task, limit: number = 5): Promise<MatchResult[]> {
+  try {
+    // Get all active workers
+    const result = await query<Worker>('SELECT * FROM workers WHERE is_active = true');
+    const workers: Worker[] = result.rows;
+
+    // DETERMINISTIC ENGINE LAYER
+    // Calculate initial scores using rigid logic (Matching Engine + Trust Engine + Fraud Engine simulated)
+    const engineCandidates = workers.map((worker) => {
+      let matchScore = 50; 
+
+      // Skill matching
+      const matchedSkills = (worker.skills || []).filter((skill: string) =>
+        (task.required_skills || []).includes(skill)
+      );
+      matchScore += matchedSkills.length * 15;
+
+      // Rating bonus
+      matchScore += Math.min(worker.avg_rating * 10, 30);
+
+      // Trust Engine Score 
+      const trustScore = worker.trust_score;
+      matchScore += Math.min((trustScore / 1000) * 20, 20);
+
+      // Location proximity
+      const distance = calculateDistance(
+        task.location_latitude,
+        task.location_longitude,
+        worker.latitude,
+        worker.longitude
+      );
+      const distanceScore = Math.max(0, 20 - (distance / 2));
+      matchScore += distanceScore;
+
+      // Experience factor
+      const experienceBonus = Math.min(worker.tasks_completed / 10, 10);
+      matchScore += experienceBonus;
+
+      // Simulated fraud risk engine (0-100)
+      const fraudRisk = Math.max(0, 100 - worker.tasks_completed * 2);
+
+      return {
+        worker,
+        distance,
+        candidateData: {
+          worker_id: worker.id,
+          name: worker.name,
+          match_score: matchScore,
+          trust_score: trustScore,
+          distance_score: distanceScore,
+          fraud_risk: fraudRisk,
+          verification_confidence: 0
+        }
+      };
+    }).sort((a, b) => b.candidateData.match_score - a.candidateData.match_score).slice(0, limit);
+
+    // AI DECISION SYNTHESIS LAYER
+    const synthesisInput: SynthesisInput = {
+      task: {
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        required_skills: task.required_skills,
+        task_location: task.task_location,
+        amount_naira: task.amount_naira,
+        due_date: task.due_date
+      },
+      candidates: engineCandidates.map(c => c.candidateData)
+    };
+
+    const finalizedDecision = await synthesizeDecision(synthesisInput);
+
+    // Reconstruct MatchResult array, ensuring the chosen candidate is first and reasons are returned
+    const finalRanked = finalizedDecision.ranking.map(r => {
+      const ec = engineCandidates.find(c => c.candidateData.worker_id.toString() === r.worker_id);
+      if (!ec) return null;
+      return {
+        worker_id: ec.worker.id,
+        name: ec.worker.name,
+        match_score: typeof r.score === 'number' ? r.score : parseFloat(r.score as string) || ec.candidateData.match_score,
+        distance_km: Math.round(ec.distance * 100) / 100,
+        reasons: r.worker_id === finalizedDecision.selected_worker_id 
+          ? [finalizedDecision.reasoning, ...finalizedDecision.risk_analysis] 
+          : ['Ranked lower due to AI tradeoffs analysis']
+      };
+    }).filter(Boolean) as MatchResult[];
+
+    return finalRanked.length > 0 ? finalRanked : engineCandidates.map(ec => ({
+      worker_id: ec.worker.id,
+      name: ec.worker.name,
+      match_score: ec.candidateData.match_score,
+      distance_km: Math.round(ec.distance * 100) / 100,
+      reasons: ["Fallback candidate from deterministic engine."]
+    }));
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('[Engine] Error getting worker matches:', errorMessage);
+    throw error;
+  }
+}
+
+async function verifyTaskCompletion(taskId: number, proofData: any): Promise<{
+  verified: boolean;
+  confidence: number;
+  details: string;
+}> {
+  try {
+    const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [taskId]);
+    if (taskResult.rows.length === 0) {
+      throw new Error('Task not found');
+    }
+    const task = taskResult.rows[0];
+
+    // DEFINITIVE VERIFICATION ENGINE (Simulated parsing/deterministic logic)
+    // Replace Claude with deterministic verification rules
+    let verified = false;
+    let confidence = 0;
+    const missingItems = [];
+
+    // Basic proof checking
+    if (proofData && (proofData.file_url || proofData.images || proofData.text)) {
+      verified = true;
+      confidence = 75; // Initial deterministic score
+    } else {
+      missingItems.push("Missing core proof files or required text submission.");
+    }
+
+    if (proofData?.location) {
+      const dist = calculateDistance(task.location_latitude, task.location_longitude, proofData.location.lat, proofData.location.lng);
+      if (dist <= 1.0) {
+        confidence += 20; // Within 1km
+      } else {
+        missingItems.push(`Submitted from distant location (${Math.round(dist)}km away).`);
+      }
+    }
+
+    const report = {
+      verified: verified && missingItems.length === 0,
+      confidence: confidence,
+      details: missingItems.length ? missingItems.join(" ") : "All requirements met deterministically."
+    };
+
+    return report;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('[Engine] Error verifying task completion:', errorMessage);
+    throw error;
+  }
+}
+
+export { getWorkerMatches, verifyTaskCompletion };

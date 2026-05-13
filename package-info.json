@@ -1,0 +1,24 @@
+{
+  "name": "taskverify-backend",
+  "version": "1.0.0",
+  "displayName": "TaskVerify Backend API",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/taskverify/backend"
+  },
+  "bugs": {
+    "url": "https://github.com/taskverify/backend/issues"
+  },
+  "homepage": "https://taskverify.app",
+  "keywords": [
+    "gig",
+    "tasks",
+    "verification",
+    "escrow",
+    "ai",
+    "workers",
+    "squad"
+  ],
+  "author": "TaskVerify Team",
+  "license": "Proprietary"
+}
