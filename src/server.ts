@@ -6,6 +6,7 @@ import swaggerUi from 'swagger-ui-express';
 import { initializeDatabase } from './db/init';
 import { errorHandler, requestLogger, rateLimit } from './middleware';
 import openapiSpec from './docs/openapi';
+import path from 'path';
 
 // Routes
 import taskRoutes from './routes/tasks';
@@ -39,6 +40,9 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
   }
 });
 
+// Serve static files from the uploads directory
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+
 // Health check
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ 
@@ -62,6 +66,7 @@ app.use('/api/docs', ...swaggerUi.serve, swaggerUi.setup(openapiSpec, {
 }));
 
 // API Routes
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 app.use('/api/v1/tasks', taskRoutes);
 app.use('/api/v1/workers', workerRoutes);
 app.use('/api/v1/webhooks', webhookRoutes);

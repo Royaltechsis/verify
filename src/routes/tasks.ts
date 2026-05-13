@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import multer from 'multer';
 import { query } from '../db/pool';
 import { v4 as uuidv4 } from 'uuid';
 import { getWorkerMatches, verifyTaskCompletion } from '../services/ai-matching';
@@ -6,6 +7,16 @@ import { createSquadEscrow } from '../services/squad-service';
 import type { Task } from '../types';
 
 const router = Router();
+
+// Configure storage
+const storage = multer.diskStorage({
+  destination: './uploads/',
+  filename: (_req, file, cb) => {
+    cb(null, `${Date.now()}-${file.originalname}`);
+  }
+});
+
+const upload = multer({ storage: storage });
 
 // Get all tasks
 router.get('/', async (req: Request, res: Response) => {
@@ -149,12 +160,25 @@ router.post('/:id/assign', async (req: Request, res: Response) => {
 });
 
 // Submit task completion proof
-router.post('/:id/submit-proof', async (req: Request, res: Response) => {
+router.post('/:id/submit-proof', upload.array('files', 3), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { proof_submission } = req.body;
+    const { text } = req.body;
+    
+    // Access files via req.files
+    const files = req.files as Express.Multer.File[];
+    let fileUrls: string[] = [];
+    
+    if (files) {
+      fileUrls = files.map(f => `http://localhost:${process.env.PORT || 3001}/uploads/${f.filename}`);
+    }
 
-    if (!proof_submission) {
+    const proof_submission = {
+      text,
+      files: fileUrls
+    };
+
+    if (!proof_submission.text && fileUrls.length === 0) {
       return res.status(400).json({ error: 'Proof submission is required' });
     }
 

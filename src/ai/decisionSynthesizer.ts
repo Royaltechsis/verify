@@ -70,20 +70,62 @@ export interface ProofVerificationOutput {
 
 // ─── Core LLM call ──────────────────────────────────────────────────────────
 
-async function callGemini(systemInstruction: string, userPrompt: string, retryOnRateLimit = true): Promise<string> {
+async function callGemini(systemInstruction: string, userPrompt: string, imageUrls: string[] = [], retryOnRateLimit = true): Promise<string> {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not set');
   }
 
-  const model = 'gemini-3-flash-preview';
+  const model = 'gemini-2.5-flash';
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
   // v1beta: fold system instruction into user turn for broadest compatibility
   const fullPrompt = `${systemInstruction}\n\n${userPrompt}`;
 
+  // Fetch images if provided
+  const imageParts: any[] = [];
+  for (const imgUrl of imageUrls) {
+    try {
+      if (imgUrl.startsWith('http')) {
+        const response = await fetch(imgUrl);
+        const buffer = await response.arrayBuffer();
+        const mimeType = response.headers.get('content-type') || 'image/jpeg';
+        imageParts.push({
+          inlineData: {
+            data: Buffer.from(buffer).toString("base64"),
+            mimeType: mimeType,
+          }
+        });
+      } else {
+        // Fallback for paths that might be local
+        const fs = require('fs');
+        const path = require('path');
+        const buffer = fs.readFileSync(imgUrl);
+        const ext = path.extname(imgUrl).toLowerCase();
+        let mimeType = 'image/jpeg';
+        if (ext === '.png') mimeType = 'image/png';
+        if (ext === '.webp') mimeType = 'image/webp';
+        
+        imageParts.push({
+          inlineData: {
+            data: buffer.toString('base64'),
+            mimeType: mimeType
+          }
+        });
+      }
+    } catch (e) {
+      console.warn(`[DecisionSynthesizer] Failed to load image ${imgUrl}:`, e);
+    }
+  }
+
   const payload = {
     contents: [
-      { role: 'user', parts: [{ text: fullPrompt }] }
+      { 
+        role: 'user', 
+        parts: [
+          { text: fullPrompt },
+          ...imageParts
+        ] 
+      }
     ],
     generationConfig: {
       responseMimeType: 'application/json',
@@ -105,7 +147,7 @@ async function callGemini(systemInstruction: string, userPrompt: string, retryOn
     const delayMs = retryDelay ? parseInt(retryDelay) * 1000 : 15000;
     console.warn(`[DecisionSynthesizer] ${res.status} — retrying in ${delayMs / 1000}s ...`);
     await new Promise(r => setTimeout(r, delayMs));
-    return callGemini(systemInstruction, userPrompt, false); // no second retry
+    return callGemini(systemInstruction, userPrompt, imageUrls, false); // no second retry
   }
 
   if (!res.ok) {
@@ -120,9 +162,9 @@ async function callGemini(systemInstruction: string, userPrompt: string, retryOn
 }
 
 /** Fallback: tries Groq or OpenRouter if Gemini key not present */
-async function callLLM(systemInstruction: string, userPrompt: string): Promise<string> {
+async function callLLM(systemInstruction: string, userPrompt: string, imageUrls: string[] = []): Promise<string> {
   if (process.env.GEMINI_API_KEY) {
-    return callGemini(systemInstruction, userPrompt);
+    return callGemini(systemInstruction, userPrompt, imageUrls);
   }
 
   if (process.env.GROQ_API_KEY) {
@@ -231,13 +273,12 @@ Return this exact JSON shape:
 
 // ─── 2. Proof Verification Synthesizer ──────────────────────────────────────
 
-const VERIFICATION_SYSTEM = `You are the Proof Verification Engine for TaskVerify.
-You receive a task's deliverable specification, a worker's submitted proof, and a pre-computed deterministic check result.
-Your job:
-- Evaluate whether the proof genuinely satisfies the deliverable_spec.
-- Use the deterministic result as a data signal, not as the final verdict.
-- Be strict: vague proofs or proofs that clearly don't match the spec should be flagged.
-- Return ONLY valid JSON, no markdown, no extra text.`;
+const VERIFICATION_SYSTEM = `You are the Proof Verification Engine.
+Your task is to perform a VISUAL INSPECTION of the provided images.
+1. COMPARE: Check if the images visually represent a valid deliverable according to the task spec. (e.g. FUTA ID card).
+2. REJECT: If the image is a towel, a random object, or does not clearly display the expected visual proof, you MUST return verified: false.
+3. ADVISE: If verified is false, provide a specific flag describing what was seen instead (e.g., "Image contains towels, not an ID card").
+Return ONLY valid JSON, no markdown, no extra text.`;
 
 export async function verifyProofWithAI(input: ProofVerificationInput): Promise<ProofVerificationOutput> {
   const userPrompt = `Task Details:
@@ -263,7 +304,17 @@ Guidelines:
 - "flags" lists specific missing items or concerns; empty array if all good.`;
 
   try {
-    const raw = await callLLM(VERIFICATION_SYSTEM, userPrompt);
+    // Extract images if provided in proof
+    let imageUrls: string[] = [];
+    if (input.proof && Array.isArray(input.proof.files)) {
+      imageUrls = input.proof.files;
+    } else if (input.proof && typeof input.proof === 'string' && input.proof.startsWith('http')) {
+      imageUrls = [input.proof];
+    } else if (input.proof && input.proof.fileUrl) {
+      imageUrls = [input.proof.fileUrl];
+    }
+
+    const raw = await callLLM(VERIFICATION_SYSTEM, userPrompt, imageUrls);
     const result: ProofVerificationOutput = JSON.parse(extractJSON(raw));
     console.log(`[DecisionSynthesizer] Proof verification → verified=${result.verified} confidence=${result.confidence}`);
     await logSynthesisDecision('verification', input, result);

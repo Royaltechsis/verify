@@ -201,24 +201,19 @@ const openapiSpec = {
       SubmitProofRequest: {
         required: true,
         content: {
-          'application/json': {
+          'multipart/form-data': {
             schema: {
               type: 'object',
-              required: ['proof_submission'],
               properties: {
-                proof_submission: {
-                  type: 'object',
-                  description: 'Proof of task completion. Include file_url, images, or text. Optionally include location for proximity check.',
-                  example: {
-                    file_url: 'https://example.com/proof.jpg',
-                    text: 'Task completed as specified.',
-                    location: { lat: 6.6018, lng: 3.3515 }
-                  }
+                files: {
+                  type: 'array',
+                  items: { type: 'string', format: 'binary' }
                 },
-              },
-            },
-          },
-        },
+                text: { type: 'string' }
+              }
+            }
+          }
+        }
       },
       ComplaintRequest: {
         required: false,
