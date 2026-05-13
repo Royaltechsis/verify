@@ -236,7 +236,7 @@ router.post('/:id/complaint', async (req: Request, res: Response) => {
 router.post('/:id/dispute', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { message } = req.body;
+    const { message: _message } = req.body;
 
     const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
     if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });

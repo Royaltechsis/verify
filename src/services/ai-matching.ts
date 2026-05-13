@@ -1,5 +1,5 @@
 import { query } from '../db/pool';
-import { synthesizeDecision, SynthesisInput } from '../ai/decisionSynthesizer';
+import { synthesizeDecision, verifyProofWithAI, SynthesisInput } from '../ai/decisionSynthesizer';
 
 interface Task {
   id: number;
@@ -149,6 +149,7 @@ async function verifyTaskCompletion(taskId: number, proofData: any): Promise<{
   verified: boolean;
   confidence: number;
   details: string;
+  flags?: string[];
 }> {
   try {
     const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [taskId]);
@@ -157,36 +158,69 @@ async function verifyTaskCompletion(taskId: number, proofData: any): Promise<{
     }
     const task = taskResult.rows[0];
 
-    // DEFINITIVE VERIFICATION ENGINE (Simulated parsing/deterministic logic)
-    // Replace Claude with deterministic verification rules
-    let verified = false;
-    let confidence = 0;
-    const missingItems = [];
+    // ── STAGE 1: Deterministic Pre-check ────────────────────────────────────
+    // Fast, rule-based checks that run before the AI call.
+    let deterministicVerified = false;
+    let deterministicConfidence = 0;
+    const missingItems: string[] = [];
 
-    // Basic proof checking
+    // 1a. Proof content check — must have at least one of: file_url, images, text
     if (proofData && (proofData.file_url || proofData.images || proofData.text)) {
-      verified = true;
-      confidence = 75; // Initial deterministic score
+      deterministicVerified = true;
+      deterministicConfidence = 70;
     } else {
-      missingItems.push("Missing core proof files or required text submission.");
+      missingItems.push('Missing core proof content (file_url, images, or text required).');
     }
 
-    if (proofData?.location) {
-      const dist = calculateDistance(task.location_latitude, task.location_longitude, proofData.location.lat, proofData.location.lng);
+    // 1b. GPS proximity check — optional but boosts or penalises confidence
+    if (proofData?.location?.lat != null && proofData?.location?.lng != null) {
+      const dist = calculateDistance(
+        task.location_latitude,
+        task.location_longitude,
+        proofData.location.lat,
+        proofData.location.lng
+      );
       if (dist <= 1.0) {
-        confidence += 20; // Within 1km
+        deterministicConfidence += 20; // Within 1 km — strong signal
+      } else if (dist <= 5.0) {
+        deterministicConfidence += 5;  // Nearby — weak signal
+        missingItems.push(`Proof submitted ${Math.round(dist)}km from task location (expected ≤1km).`);
       } else {
-        missingItems.push(`Submitted from distant location (${Math.round(dist)}km away).`);
+        deterministicVerified = false;
+        missingItems.push(`Proof submitted ${Math.round(dist)}km away — location mismatch.`);
       }
     }
 
-    const report = {
-      verified: verified && missingItems.length === 0,
-      confidence: confidence,
-      details: missingItems.length ? missingItems.join(" ") : "All requirements met deterministically."
+    const deterministicResult = {
+      verified: deterministicVerified && missingItems.length === 0,
+      confidence: deterministicConfidence,
+      details: missingItems.length
+        ? missingItems.join(' ')
+        : 'Deterministic checks passed (content present, location valid).'
     };
 
-    return report;
+    console.log(`[Engine] Deterministic verification → verified=${deterministicResult.verified} confidence=${deterministicResult.confidence}`);
+
+    // ── STAGE 2: AI Synthesis (Gemini) ──────────────────────────────────────
+    // Gemini evaluates the proof against the task's deliverable_spec
+    // and refines the verdict with natural-language reasoning.
+    const aiResult = await verifyProofWithAI({
+      task: {
+        title: task.title,
+        description: task.description,
+        deliverable_spec: task.deliverable_spec,
+        task_location: task.task_location
+      },
+      proof: proofData,
+      deterministicResult
+    });
+
+    return {
+      verified: aiResult.verified,
+      confidence: aiResult.confidence,
+      details: aiResult.details,
+      flags: aiResult.flags
+    };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     console.error('[Engine] Error verifying task completion:', errorMessage);

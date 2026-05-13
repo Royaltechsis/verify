@@ -2,21 +2,25 @@ import { query } from '../db/pool';
 
 /**
  * AI Decision Synthesizer
- * 
- * Takes structured outputs from deterministic engines (Matching, Trust, Fraud, Verification)
- * and uses an LLM purely for interpreting, ranking, and explaining.
- * It DOES NOT make the raw decisions or compute scores.
+ *
+ * Two jobs:
+ *  1. synthesizeDecision  — interprets deterministic engine scores to rank & explain worker matches
+ *  2. verifyProofWithAI   — evaluates submitted proof against task deliverable_spec using Gemini
+ *
+ * The LLM NEVER computes raw scores — it only interprets, ranks, and explains.
+ * Every decision (AI or fallback) is written to `decision_synthesis_logs`.
  */
+
+// ─── Interfaces ─────────────────────────────────────────────────────────────
 
 export interface CandidateData {
   worker_id: number;
+  name?: string;
   match_score: number;
   trust_score: number;
   distance_score: number;
   fraud_risk?: number;
   verification_confidence?: number;
-  // added context
-  name?: string;
 }
 
 export interface TaskData {
@@ -42,88 +46,85 @@ export interface SynthesisOutput {
   confidence: number;
 }
 
-export async function synthesizeDecision(input: SynthesisInput): Promise<SynthesisOutput> {
-  const prompt = `
-You are an AI Decision Synthesis Engine.
-Your role: Decision Interpreter + Ranking + Explanation Engine.
-You MUST NOT override raw score computation data. You must rank the provided candidates based ONLY on the metrics provided.
-
-Task Context:
-${JSON.stringify(input.task, null, 2)}
-
-Candidates (from Deterministic Engines):
-${JSON.stringify(input.candidates, null, 2)}
-
-Provide a JSON response with the following exact structure NO MARKDOWN OR OTHER TEXT:
-{
-  "selected_worker_id": "string",
-  "ranking": [
-    { "worker_id": "string", "score": number }
-  ],
-  "reasoning": "string",
-  "risk_analysis": ["string"],
-  "confidence": number
+export interface ProofVerificationInput {
+  task: {
+    title: string;
+    description: string;
+    deliverable_spec: any;
+    task_location: string;
+  };
+  proof: any;
+  deterministicResult: {
+    verified: boolean;
+    confidence: number;
+    details: string;
+  };
 }
-`;
 
-  try {
-    const aiResponse = await callLLM(prompt);
-    
-    // Parse response
-    let jsonStr = aiResponse.trim();
-    const jsonMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[1].trim();
-    }
-    
-    const arrayMatch = jsonStr.match(/\{[\s\S]*\}/);
-    if (arrayMatch) {
-      jsonStr = arrayMatch[0];
-    }
+export interface ProofVerificationOutput {
+  verified: boolean;
+  confidence: number;
+  details: string;
+  flags: string[];
+}
 
-    const synthesized: SynthesisOutput = JSON.parse(jsonStr);
+// ─── Core LLM call ──────────────────────────────────────────────────────────
 
-    // Logging for auditability
-    await logSynthesisDecision(input, synthesized);
-
-    return synthesized;
-  } catch (error) {
-    console.error('[DecisionSynthesizer] Failed to synthesize decision or invalid JSON. Falling back to deterministic.', error);
-    
-    // Fallback: deterministic ranking based on match_score
-    const sorted = [...input.candidates].sort((a, b) => b.match_score - a.match_score);
-    const topCandidate = sorted[0];
-
-    const fallback: SynthesisOutput = {
-      selected_worker_id: topCandidate ? topCandidate.worker_id.toString() : "",
-      ranking: sorted.map(c => ({ worker_id: c.worker_id.toString(), score: c.match_score })),
-      reasoning: "Fallback strictly to matching engine scores due to synthesis error.",
-      risk_analysis: ["Fallback utilized. No AI risk interpretation available."],
-      confidence: 100
-    };
-
-    await logSynthesisDecision(input, fallback);
-    return fallback;
+async function callGemini(systemInstruction: string, userPrompt: string, retryOnRateLimit = true): Promise<string> {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY is not set');
   }
+
+  const model = 'gemini-3-flash-preview';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+
+  // v1beta: fold system instruction into user turn for broadest compatibility
+  const fullPrompt = `${systemInstruction}\n\n${userPrompt}`;
+
+  const payload = {
+    contents: [
+      { role: 'user', parts: [{ text: fullPrompt }] }
+    ],
+    generationConfig: {
+      responseMimeType: 'application/json',
+      temperature: 0.1,
+      maxOutputTokens: 2048  // 1024 was too small for multi-candidate matching responses
+    }
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  // Auto-retry once on rate limit (429) or transient overload (503)
+  if ((res.status === 429 || res.status === 503) && retryOnRateLimit) {
+    const errData: any = await res.json().catch(() => ({}));
+    const retryDelay = errData?.error?.details?.find((d: any) => d.retryDelay)?.retryDelay;
+    const delayMs = retryDelay ? parseInt(retryDelay) * 1000 : 15000;
+    console.warn(`[DecisionSynthesizer] ${res.status} — retrying in ${delayMs / 1000}s ...`);
+    await new Promise(r => setTimeout(r, delayMs));
+    return callGemini(systemInstruction, userPrompt, false); // no second retry
+  }
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`Gemini API error ${res.status}: ${errBody}`);
+  }
+
+  const data: any = await res.json();
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error('Gemini returned empty response');
+  return text;
 }
 
-async function callLLM(prompt: string): Promise<string> {
-  // Support for multiple providers
+/** Fallback: tries Groq or OpenRouter if Gemini key not present */
+async function callLLM(systemInstruction: string, userPrompt: string): Promise<string> {
   if (process.env.GEMINI_API_KEY) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json" }
-      })
-    });
-    if (!res.ok) throw new Error('Gemini API Error');
-    const data: any = await res.json();
-    return data.candidates[0].content.parts[0].text;
-  } 
-  
+    return callGemini(systemInstruction, userPrompt);
+  }
+
   if (process.env.GROQ_API_KEY) {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
@@ -133,8 +134,11 @@ async function callLLM(prompt: string): Promise<string> {
       },
       body: JSON.stringify({
         model: 'llama3-8b-8192',
-        messages: [{ role: 'user', content: prompt }],
-        response_format: { type: "json_object" }
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: userPrompt }
+        ],
+        response_format: { type: 'json_object' }
       })
     });
     if (!res.ok) throw new Error('Groq API Error');
@@ -151,7 +155,10 @@ async function callLLM(prompt: string): Promise<string> {
       },
       body: JSON.stringify({
         model: 'mistralai/mixtral-8x7b-instruct',
-        messages: [{ role: 'user', content: prompt }]
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: userPrompt }
+        ]
       })
     });
     if (!res.ok) throw new Error('OpenRouter API Error');
@@ -159,28 +166,147 @@ async function callLLM(prompt: string): Promise<string> {
     return data.choices[0].message.content;
   }
 
-  throw new Error('No supported AI provider configured (GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY)');
+  throw new Error('No AI provider configured. Set GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY.');
 }
 
-async function logSynthesisDecision(input: SynthesisInput, output: SynthesisOutput) {
+/** Safely extract a JSON object from raw LLM text (handles accidental markdown fences) */
+function extractJSON(raw: string): string {
+  let s = raw.trim();
+  const fenced = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenced) s = fenced[1].trim();
+  const obj = s.match(/\{[\s\S]*\}/);
+  if (obj) s = obj[0];
+  return s;
+}
+
+// ─── 1. Worker Matching Synthesizer ─────────────────────────────────────────
+
+const MATCHING_SYSTEM = `You are the AI Decision Synthesis Engine for TaskVerify, a Nigerian gig-economy platform.
+Your ONLY job is to interpret pre-computed deterministic scores and produce a ranked worker recommendation.
+Rules:
+- Do NOT alter or invent scores; base ranking strictly on the provided metrics.
+- Return pure JSON, no markdown, no explanation outside the JSON structure.
+- Be concise in "reasoning" — one clear sentence explaining the top pick.
+- "risk_analysis" should list 1-3 specific risk factors derived from the data (fraud_risk, low trust_score, distance, etc).`;
+
+export async function synthesizeDecision(input: SynthesisInput): Promise<SynthesisOutput> {
+  const userPrompt = `Task:
+${JSON.stringify(input.task, null, 2)}
+
+Candidates (from deterministic engines):
+${JSON.stringify(input.candidates, null, 2)}
+
+Return this exact JSON shape:
+{
+  "selected_worker_id": "<string id of best candidate>",
+  "ranking": [{ "worker_id": "<string>", "score": <number> }],
+  "reasoning": "<one sentence why top candidate was chosen>",
+  "risk_analysis": ["<risk 1>", "<risk 2>"],
+  "confidence": <0-100>
+}`;
+
   try {
-    // We create the table if it doesn't exist just as a safety net, 
-    // or assume it's created via migrations. Let's create it if not exists.
+    const raw = await callLLM(MATCHING_SYSTEM, userPrompt);
+    const synthesized: SynthesisOutput = JSON.parse(extractJSON(raw));
+    console.log(`[DecisionSynthesizer] Matched → worker ${synthesized.selected_worker_id} (confidence: ${synthesized.confidence})`);
+    await logSynthesisDecision('matching', input, synthesized);
+    return synthesized;
+  } catch (error) {
+    console.error('[DecisionSynthesizer] Synthesis failed — falling back to deterministic ranking:', error instanceof Error ? error.message : error);
+
+    const sorted = [...input.candidates].sort((a, b) => b.match_score - a.match_score);
+    const top = sorted[0];
+    const fallback: SynthesisOutput = {
+      selected_worker_id: top ? top.worker_id.toString() : '',
+      ranking: sorted.map(c => ({ worker_id: c.worker_id.toString(), score: c.match_score })),
+      reasoning: 'Fallback to deterministic engine scores (AI synthesis unavailable).',
+      risk_analysis: ['AI synthesis unavailable — manual review recommended.'],
+      confidence: 100
+    };
+
+    await logSynthesisDecision('matching', input, fallback);
+    return fallback;
+  }
+}
+
+// ─── 2. Proof Verification Synthesizer ──────────────────────────────────────
+
+const VERIFICATION_SYSTEM = `You are the Proof Verification Engine for TaskVerify.
+You receive a task's deliverable specification, a worker's submitted proof, and a pre-computed deterministic check result.
+Your job:
+- Evaluate whether the proof genuinely satisfies the deliverable_spec.
+- Use the deterministic result as a data signal, not as the final verdict.
+- Be strict: vague proofs or proofs that clearly don't match the spec should be flagged.
+- Return ONLY valid JSON, no markdown, no extra text.`;
+
+export async function verifyProofWithAI(input: ProofVerificationInput): Promise<ProofVerificationOutput> {
+  const userPrompt = `Task Details:
+${JSON.stringify(input.task, null, 2)}
+
+Worker's Submitted Proof:
+${JSON.stringify(input.proof, null, 2)}
+
+Deterministic Pre-check:
+${JSON.stringify(input.deterministicResult, null, 2)}
+
+Return this exact JSON shape:
+{
+  "verified": <true|false>,
+  "confidence": <0-100>,
+  "details": "<one clear sentence summarising the verdict>",
+  "flags": ["<concern 1>", "<concern 2>"]
+}
+
+Guidelines:
+- "verified" = true only if proof clearly satisfies the deliverable_spec requirements.
+- "confidence" reflects how certain you are; use the deterministic confidence as a starting baseline.
+- "flags" lists specific missing items or concerns; empty array if all good.`;
+
+  try {
+    const raw = await callLLM(VERIFICATION_SYSTEM, userPrompt);
+    const result: ProofVerificationOutput = JSON.parse(extractJSON(raw));
+    console.log(`[DecisionSynthesizer] Proof verification → verified=${result.verified} confidence=${result.confidence}`);
+    await logSynthesisDecision('verification', input, result);
+    return result;
+  } catch (error) {
+    console.error('[DecisionSynthesizer] Proof verification AI failed — using deterministic fallback:', error instanceof Error ? error.message : error);
+    return {
+      verified: input.deterministicResult.verified,
+      confidence: input.deterministicResult.confidence,
+      details: `${input.deterministicResult.details} (AI synthesis unavailable — deterministic result used.)`,
+      flags: ['AI synthesis unavailable.']
+    };
+  }
+}
+
+// ─── Audit Logger ────────────────────────────────────────────────────────────
+
+async function logSynthesisDecision(type: 'matching' | 'verification', input: any, output: any) {
+  try {
     await query(`
       CREATE TABLE IF NOT EXISTS decision_synthesis_logs (
-        id SERIAL PRIMARY KEY,
-        task_id INTEGER,
-        input_data JSONB,
+        id          SERIAL PRIMARY KEY,
+        type        TEXT NOT NULL DEFAULT 'matching',
+        task_id     INTEGER,
+        input_data  JSONB,
         output_data JSONB,
-        created_at TIMESTAMP DEFAULT NOW()
+        created_at  TIMESTAMP DEFAULT NOW()
       )
     `);
 
+    // Patch existing tables that were created before the 'type' column was added
+    await query(`
+      ALTER TABLE decision_synthesis_logs
+        ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'matching'
+    `);
+
+    const taskId = input?.task?.id ?? null;
     await query(
-      `INSERT INTO decision_synthesis_logs (task_id, input_data, output_data) VALUES ($1, $2, $3)`,
-      [input.task.id || null, JSON.stringify(input), JSON.stringify(output)]
+      `INSERT INTO decision_synthesis_logs (type, task_id, input_data, output_data) VALUES ($1, $2, $3, $4)`,
+      [type, taskId, JSON.stringify(input), JSON.stringify(output)]
     );
   } catch (error) {
-    console.error('[DecisionSynthesizer] Failed to log decision:', error);
+    // Non-fatal — never let logging break the main flow
+    console.error('[DecisionSynthesizer] Failed to write audit log:', error instanceof Error ? error.message : error);
   }
 }

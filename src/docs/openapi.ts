@@ -2,8 +2,8 @@ const openapiSpec = {
   openapi: '3.0.3',
   info: {
     title: 'TaskVerify API',
-    version: '1.0.0',
-    description: 'TaskVerify backend API for task management, worker matching, escrow, and webhooks.',
+    version: '1.1.0',
+    description: 'TaskVerify backend API — AI-powered gig task verification with Squad escrow. AI Layer (gemini-3-flash-preview): POST /api/v1/tasks runs deterministic matching then Gemini ranks candidates; POST /api/v1/tasks/:id/submit-proof runs deterministic checks then Gemini evaluates proof against deliverable_spec. All AI decisions fall back to deterministic automatically. Every decision is audit-logged to decision_synthesis_logs. Task status flow: posted → assigned → verified OR flagged_for_dispute → completed (auto 24h) OR complaint_filed OR disputed.',
   },
   servers: [
     {
@@ -16,6 +16,7 @@ const openapiSpec = {
     { name: 'Tasks', description: 'Task lifecycle operations' },
     { name: 'Workers', description: 'Worker profiles and performance metrics' },
     { name: 'Webhooks', description: 'Squad and verification webhook callbacks' },
+    { name: 'Mock Squad', description: 'Local mock of Squad payment API (non-production only)' },
   ],
   components: {
     schemas: {
@@ -56,7 +57,12 @@ const openapiSpec = {
           client_email: { type: 'string', nullable: true, example: 'client@example.com' },
           required_skills: { type: 'array', items: { type: 'string' }, example: ['cleaning'] },
           amount_naira: { type: 'number', example: 25000 },
-          status: { type: 'string', example: 'posted' },
+          status: {
+            type: 'string',
+            enum: ['posted', 'assigned', 'submitted', 'verified', 'flagged_for_dispute', 'completed', 'complaint_filed', 'disputed'],
+            example: 'posted',
+            description: 'State machine: posted→assigned→verified|flagged_for_dispute→completed(auto 24h)|complaint_filed|disputed',
+          },
           task_location: { type: 'string', example: 'Ikeja, Lagos' },
           location_latitude: { type: 'number', example: 6.6018 },
           location_longitude: { type: 'number', example: 3.3515 },
@@ -109,7 +115,32 @@ const openapiSpec = {
         properties: {
           verified: { type: 'boolean', example: true },
           confidence: { type: 'number', example: 88 },
-          details: { type: 'string', example: 'Proof matches the deliverable requirements.' },
+          details: { type: 'string', example: 'Proof clearly satisfies the deliverable specification.' },
+          flags: {
+            type: 'array',
+            items: { type: 'string' },
+            example: [],
+            description: 'Specific concerns or missing items flagged by the AI. Empty if all good.',
+          },
+        },
+      },
+      SubmitProofResponse: {
+        type: 'object',
+        properties: {
+          task: { $ref: '#/components/schemas/Task' },
+          verification: { $ref: '#/components/schemas/TaskVerificationResult' },
+        },
+      },
+      MockVirtualAccount: {
+        type: 'object',
+        properties: {
+          virtual_account_number: { type: 'string', example: '1234567890' },
+          beneficiary_name: { type: 'string', example: 'Mock TaskVerify Escrow' },
+          bank_code: { type: 'string', example: '033' },
+          bank_name: { type: 'string', example: 'Mocked UBA Bank' },
+          customer_identifier: { type: 'string' },
+          amount: { type: 'number', example: 25000 },
+          merchant_reference: { type: 'string', format: 'uuid' },
         },
       },
       SquadWebhookEvent: {
@@ -175,7 +206,87 @@ const openapiSpec = {
               type: 'object',
               required: ['proof_submission'],
               properties: {
-                proof_submission: { type: 'object', example: { photos: ['https://example.com/photo1.jpg'] } },
+                proof_submission: {
+                  type: 'object',
+                  description: 'Proof of task completion. Include file_url, images, or text. Optionally include location for proximity check.',
+                  example: {
+                    file_url: 'https://example.com/proof.jpg',
+                    text: 'Task completed as specified.',
+                    location: { lat: 6.6018, lng: 3.3515 }
+                  }
+                },
+              },
+            },
+          },
+        },
+      },
+      ComplaintRequest: {
+        required: false,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              properties: {},
+              description: 'No body required. Files a complaint within the 24-hour verified window.',
+            },
+          },
+        },
+      },
+      DisputeRequest: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              properties: {
+                message: { type: 'string', example: 'Worker did not complete the job properly.' },
+              },
+              description: 'Optional dispute reason message (stored for audit, not persisted to DB yet).',
+            },
+          },
+        },
+      },
+      MockCreateVARequest: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              properties: {
+                amount: { type: 'number', example: 25000 },
+                customer_identifier: { type: 'string', example: 'task-42' },
+                payment_description: { type: 'string', example: 'Escrow for task 42' },
+              },
+            },
+          },
+        },
+      },
+      MockFundTransferRequest: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['virtual_account_number', 'amount'],
+              properties: {
+                virtual_account_number: { type: 'string', example: '1234567890' },
+                amount: { type: 'number', example: 25000 },
+                narration: { type: 'string', example: 'Worker payout for task 42' },
+              },
+            },
+          },
+        },
+      },
+      MockRefundRequest: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['virtual_account_number', 'amount'],
+              properties: {
+                virtual_account_number: { type: 'string', example: '1234567890' },
+                amount: { type: 'number', example: 25000 },
               },
             },
           },
@@ -344,18 +455,76 @@ const openapiSpec = {
     '/api/v1/tasks/{id}/submit-proof': {
       post: {
         tags: ['Tasks'],
-        summary: 'Submit completion proof',
+        summary: 'Submit completion proof (triggers AI verification)',
+        description: 'Worker submits proof. The deterministic verification engine checks for file presence and GPS proximity, then the AI Decision Synthesizer interprets results. If verified, a 24-hour complaint window opens before payment auto-releases.',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         requestBody: { $ref: '#/components/requestBodies/SubmitProofRequest' },
         responses: {
           200: {
-            description: 'Proof recorded',
+            description: 'Proof recorded and AI verification result returned',
             content: {
               'application/json': {
-                schema: { $ref: '#/components/schemas/Task' },
+                schema: { $ref: '#/components/schemas/SubmitProofResponse' },
               },
             },
           },
+          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          400: { description: 'Missing proof_submission field', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+    '/api/v1/tasks/{id}/complaint': {
+      post: {
+        tags: ['Tasks'],
+        summary: 'File a complaint (within 24-hour verified window)',
+        description: 'Buyer files a complaint after AI has verified the task. Only valid when task status is `verified`. Moves task to `complaint_filed` for human intervention.',
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { $ref: '#/components/requestBodies/ComplaintRequest' },
+        responses: {
+          200: {
+            description: 'Complaint registered',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    message: { type: 'string', example: 'Complaint registered for human intervention' },
+                    task: { $ref: '#/components/schemas/Task' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Task not in verified state', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+    '/api/v1/tasks/{id}/dispute': {
+      post: {
+        tags: ['Tasks'],
+        summary: 'Manually dispute an AI-flagged task',
+        description: 'Worker manually disputes a task that was flagged by the AI as low-confidence. Only valid when task status is `flagged_for_dispute`. Moves task to `disputed`.',
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { $ref: '#/components/requestBodies/DisputeRequest' },
+        responses: {
+          200: {
+            description: 'Dispute filed',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    message: { type: 'string', example: 'Manual dispute filed' },
+                    task: { $ref: '#/components/schemas/Task' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Task not in flagged_for_dispute state', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
     },
@@ -480,8 +649,9 @@ const openapiSpec = {
       post: {
         tags: ['Webhooks'],
         summary: 'Receive Squad payment events',
+        description: 'HMAC-SHA256 signature required. Signature is computed over the raw JSON body using SQUAD_WEBHOOK_SECRET.',
         parameters: [
-          { name: 'x-squad-signature', in: 'header', required: false, schema: { type: 'string' }, description: 'HMAC signature for webhook validation' },
+          { name: 'x-squad-signature', in: 'header', required: true, schema: { type: 'string' }, description: 'HMAC-SHA256 signature of raw request body' },
         ],
         requestBody: {
           required: true,
@@ -492,7 +662,8 @@ const openapiSpec = {
           },
         },
         responses: {
-          200: { description: 'Webhook accepted' },
+          200: { description: 'Webhook accepted', content: { 'application/json': { schema: { type: 'object', properties: { status: { type: 'string', example: 'received' } } } } } },
+          400: { description: 'Missing signature or body', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           401: { description: 'Invalid signature', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
@@ -500,12 +671,119 @@ const openapiSpec = {
     '/api/v1/webhooks/verification': {
       post: {
         tags: ['Webhooks'],
-        summary: 'Receive verification results',
+        summary: 'Receive external verification results',
+        description: 'Accepts an external verification decision and updates the task status to `verified`. Intended for external AI pipeline callbacks.',
         requestBody: { $ref: '#/components/requestBodies/VerificationWebhookRequest' },
         responses: {
           200: {
             description: 'Verification recorded',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    task: { $ref: '#/components/schemas/Task' },
+                    message: { type: 'string', example: 'Task verification recorded' },
+                  },
+                },
+              },
+            },
           },
+          400: { description: 'Missing task_id or verification_result', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+    '/mock-squad/virtual-account/create': {
+      post: {
+        tags: ['Mock Squad'],
+        summary: 'Create a mock virtual account (escrow)',
+        description: 'Non-production only. Generates a fake 10-digit NUBAN and auto-fires a `virtual_account.funded` webhook after 5 seconds.',
+        requestBody: { $ref: '#/components/requestBodies/MockCreateVARequest' },
+        responses: {
+          200: {
+            description: 'Mock virtual account created',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    status: { type: 'integer', example: 200 },
+                    success: { type: 'boolean', example: true },
+                    message: { type: 'string', example: 'Virtual Account created successfully' },
+                    data: { $ref: '#/components/schemas/MockVirtualAccount' },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/mock-squad/virtual-account/fund-transfer': {
+      post: {
+        tags: ['Mock Squad'],
+        summary: 'Simulate releasing funds to a worker',
+        description: 'Non-production only. Transfers the held amount from a mock virtual account to a worker.',
+        requestBody: { $ref: '#/components/requestBodies/MockFundTransferRequest' },
+        responses: {
+          200: {
+            description: 'Transfer successful',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    status: { type: 'integer', example: 200 },
+                    success: { type: 'boolean', example: true },
+                    data: {
+                      type: 'object',
+                      properties: {
+                        reference: { type: 'string', format: 'uuid' },
+                        amount_transferred: { type: 'number' },
+                        status: { type: 'string', example: 'success' },
+                        narration: { type: 'string' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          404: { description: 'Virtual account not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+    '/mock-squad/virtual-account/refund': {
+      post: {
+        tags: ['Mock Squad'],
+        summary: 'Simulate refunding funds to client',
+        description: 'Non-production only. Refunds the held amount back to the client from a mock virtual account.',
+        requestBody: { $ref: '#/components/requestBodies/MockRefundRequest' },
+        responses: {
+          200: {
+            description: 'Refund successful',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    status: { type: 'integer', example: 200 },
+                    success: { type: 'boolean', example: true },
+                    data: {
+                      type: 'object',
+                      properties: {
+                        reference: { type: 'string', format: 'uuid' },
+                        amount_refunded: { type: 'number' },
+                        status: { type: 'string', example: 'success' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          404: { description: 'Virtual account not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
     },
