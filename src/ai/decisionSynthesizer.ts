@@ -21,6 +21,8 @@ export interface CandidateData {
   distance_score: number;
   fraud_risk?: number;
   verification_confidence?: number;
+  economic_profile?: any;
+  financial_profile?: any;
 }
 
 export interface TaskData {
@@ -223,13 +225,13 @@ function extractJSON(raw: string): string {
 
 // ─── 1. Worker Matching Synthesizer ─────────────────────────────────────────
 
-const MATCHING_SYSTEM = `You are the AI Decision Synthesis Engine for TaskVerify, a Nigerian gig-economy platform.
-Your ONLY job is to interpret pre-computed deterministic scores and produce a ranked worker recommendation.
+const MATCHING_SYSTEM = `You are the AI Decision Synthesis Engine for TaskVerify, an AI-powered economic identity and financial trust platform for informal workers.
+Your ONLY job is to interpret pre-computed deterministic scores and profiles to produce a ranked worker recommendation.
 Rules:
-- Do NOT alter or invent scores; base ranking strictly on the provided metrics.
+- Do NOT alter or invent scores; base ranking strictly on the provided metrics and profiles (especially credit_score, risk_level, and behavioral_score).
 - Return pure JSON, no markdown, no explanation outside the JSON structure.
-- Be concise in "reasoning" — one clear sentence explaining the top pick.
-- "risk_analysis" should list 1-3 specific risk factors derived from the data (fraud_risk, low trust_score, distance, etc).`;
+- Be concise in "reasoning" — one clear sentence explaining the top pick based on trust and financial identity.
+- "risk_analysis" should list 1-3 specific risk factors derived from the data (fraud_risk, economic_profile risk_level, low trust_score, distance, etc).`;
 
 export async function synthesizeDecision(input: SynthesisInput): Promise<SynthesisOutput> {
   const userPrompt = `Task:
@@ -348,13 +350,25 @@ async function logSynthesisDecision(type: 'matching' | 'verification', input: an
     // Patch existing tables that were created before the 'type' column was added
     await query(`
       ALTER TABLE decision_synthesis_logs
-        ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'matching'
+        ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'matching',
+        ADD COLUMN IF NOT EXISTS credit_score_snapshot INTEGER,
+        ADD COLUMN IF NOT EXISTS economic_profile_snapshot JSONB
     `);
 
     const taskId = input?.task?.id ?? null;
+    let credit_score_snapshot = null;
+    let economic_profile_snapshot = null;
+
+    if (type === 'matching' && input?.candidates && input.candidates.length > 0) {
+      // Just taking the snapshot of the highest ranked candidate or first available
+      const topCand = input.candidates[0];
+      if (topCand.financial_profile) credit_score_snapshot = topCand.financial_profile.credit_score;
+      if (topCand.economic_profile) economic_profile_snapshot = topCand.economic_profile;
+    }
+
     await query(
-      `INSERT INTO decision_synthesis_logs (type, task_id, input_data, output_data) VALUES ($1, $2, $3, $4)`,
-      [type, taskId, JSON.stringify(input), JSON.stringify(output)]
+      `INSERT INTO decision_synthesis_logs (type, task_id, input_data, output_data, credit_score_snapshot, economic_profile_snapshot) VALUES ($1, $2, $3, $4, $5, $6)`,
+      [type, taskId, JSON.stringify(input), JSON.stringify(output), credit_score_snapshot, economic_profile_snapshot ? JSON.stringify(economic_profile_snapshot) : null]
     );
   } catch (error) {
     // Non-fatal — never let logging break the main flow

@@ -23,6 +23,8 @@ interface Worker {
   avg_rating: number;
   trust_score: number;
   tasks_completed: number;
+  economic_profile: any;
+  financial_profile: any;
 }
 
 interface MatchResult {
@@ -95,7 +97,9 @@ async function getWorkerMatches(task: Task, limit: number = 5): Promise<MatchRes
           trust_score: trustScore,
           distance_score: distanceScore,
           fraud_risk: fraudRisk,
-          verification_confidence: 0
+          verification_confidence: 0,
+          economic_profile: worker.economic_profile,
+          financial_profile: worker.financial_profile
         }
       };
     }).sort((a, b) => b.candidateData.match_score - a.candidateData.match_score).slice(0, limit);

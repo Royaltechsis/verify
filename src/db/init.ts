@@ -26,6 +26,8 @@ async function initializeDatabase(): Promise<void> {
         total_earnings DECIMAL(15, 2) DEFAULT 0,
         current_month_earnings DECIMAL(15, 2) DEFAULT 0,
         is_active BOOLEAN DEFAULT true,
+        economic_profile JSONB DEFAULT '{}'::jsonb,
+        financial_profile JSONB DEFAULT '{}'::jsonb,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       )

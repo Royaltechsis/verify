@@ -14,6 +14,9 @@ import workerRoutes from './routes/workers';
 import webhookRoutes from './routes/webhooks';
 import mockSquadRoutes from './routes/mock-squad';
 
+// Add this to src/server.ts (or any route file)
+import { query } from './db/pool';
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -23,6 +26,17 @@ app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ limit: '10mb', extended: true }));
 app.use(requestLogger);
 app.use(rateLimit(60000, 100));
+
+
+app.get('/api/v1/debug/ai-logs', async (_req: Request, res: Response) => {
+  try {
+    const result = await query('SELECT * FROM decision_synthesis_logs ORDER BY created_at DESC LIMIT 20');
+    return res.json(result.rows);
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to fetch AI logs' });
+  }
+});
+
 
 // Store raw body for webhook signature validation
 app.use((req: Request, _res: Response, next: NextFunction) => {

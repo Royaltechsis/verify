@@ -75,11 +75,27 @@ router.post('/', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
+    const defaultEconomicProfile = {
+      identity_verified: false,
+      verification_sources: phone ? ['phone'] : [],
+      behavioral_score: 50,
+      reliability_score: 50,
+      earning_pattern: [],
+      risk_level: 'medium'
+    };
+    
+    const defaultFinancialProfile = {
+      credit_score: 300,
+      loan_eligibility: false,
+      recommended_loan: 0,
+      insurance_risk_level: 'medium'
+    };
+
     const result = await query(
-      `INSERT INTO workers (name, email, phone, skills, bio, primary_location, latitude, longitude, avatar_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO workers (name, email, phone, skills, bio, primary_location, latitude, longitude, avatar_url, economic_profile, financial_profile)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (email) DO UPDATE SET updated_at = NOW() RETURNING *`,
-      [name, email, phone, skills || [], bio, primary_location, latitude, longitude, avatar_url]
+      [name, email, phone, skills || [], bio, primary_location, latitude, longitude, avatar_url, JSON.stringify(defaultEconomicProfile), JSON.stringify(defaultFinancialProfile)]
     );
 
     return res.status(201).json(result.rows[0]);
@@ -154,6 +170,47 @@ router.get('/:id/stats', async (req: Request, res: Response) => {
     const errorMessage = error instanceof Error ? error.message : String(error);
     console.error('[Workers] Error fetching worker stats:', errorMessage);
     return res.status(500).json({ error: 'Failed to fetch worker stats' });
+  }
+});
+
+// Get financial profile
+router.get('/:id/financial-profile', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+
+    // Get the latest profile
+    const result = await query(
+      `SELECT financial_profile, economic_profile, current_month_earnings FROM workers WHERE id = $1`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Worker not found' });
+    }
+
+    // Refresh loan recommendations on the fly just to be safe
+    const financial = result.rows[0].financial_profile || {};
+    const economic = result.rows[0].economic_profile || {};
+    const monthly_earnings = Number(result.rows[0].current_month_earnings) || 0;
+    
+    // Derived values simulated for bank API
+    const credit_score = financial.credit_score || 300;
+    const loan_eligibility = credit_score > 600;
+    
+    // Recommended loan based on monthly earnings (e.g. 50% max)
+    const recommended_loan = loan_eligibility ? Math.floor(monthly_earnings * 0.5) : 0;
+    
+    const insurance_risk_level = economic.risk_level || 'medium';
+
+    return res.json({
+      credit_score,
+      loan_eligibility,
+      recommended_loan,
+      insurance_risk_level
+    });
+  } catch (error) {
+    console.error('[Workers] Error fetching financial profile:', error);
+    return res.status(500).json({ error: 'Failed to fetch financial profile' });
   }
 });
 

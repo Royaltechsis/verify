@@ -640,6 +640,31 @@ const openapiSpec = {
         },
       },
     },
+    '/api/v1/workers/{id}/financial-profile': {
+      get: {
+        tags: ['Workers', 'Financial Intelligence'],
+        summary: 'Get worker AI-driven financial and credit profile',
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: {
+          200: {
+            description: 'Financial profile returned',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    credit_score: { type: 'integer' },
+                    loan_eligibility: { type: 'boolean' },
+                    recommended_loan: { type: 'number' },
+                    insurance_risk_level: { type: 'string' }
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
     '/api/v1/webhooks/squad': {
       post: {
         tags: ['Webhooks'],

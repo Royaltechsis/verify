@@ -4,6 +4,7 @@ import { query } from '../db/pool';
 import { v4 as uuidv4 } from 'uuid';
 import { getWorkerMatches, verifyTaskCompletion } from '../services/ai-matching';
 import { createSquadEscrow } from '../services/squad-service';
+import { processTaskOutcome } from '../services/financial-intelligence';
 import type { Task } from '../types';
 
 const router = Router();
@@ -211,10 +212,14 @@ router.post('/:id/submit-proof', upload.array('files', 3), async (req: Request, 
       setTimeout(async () => {
         try {
           // Verify it hasn't been challenged
-          const checkStatus = await query('SELECT status FROM tasks WHERE id = $1', [id]);
+          const checkStatus = await query('SELECT status, assigned_worker_id, amount_naira FROM tasks WHERE id = $1', [id]);
           if (checkStatus.rows.length > 0 && checkStatus.rows[0].status === 'verified') {
             // No complaints within window -> Release Payment -> completed
             await query(`UPDATE tasks SET status = 'completed', completed_at = NOW() WHERE id = $1`, [id]);
+            
+            // Process AI financial platform learning loop and profile updates
+            await processTaskOutcome(checkStatus.rows[0].assigned_worker_id, true, checkStatus.rows[0].amount_naira);
+            
             console.log(`[Tasks] Payment released for task ${id}. Status = completed`);
           }
         } catch (err) {
@@ -248,6 +253,9 @@ router.post('/:id/complaint', async (req: Request, res: Response) => {
       `UPDATE tasks SET status = 'complaint_filed' WHERE id = $1 RETURNING *`,
       [id]
     );
+
+    // Apply penalty to the worker's economic profile
+    await processTaskOutcome(taskResult.rows[0].assigned_worker_id, false, 0);
 
     return res.json({ message: 'Complaint registered for human intervention', task: result.rows[0] });
   } catch (error) {
