@@ -63,9 +63,9 @@ const openapiSpec = {
           amount_naira: { type: 'number', example: 25000 },
           status: {
             type: 'string',
-            enum: ['posted', 'assigned', 'submitted', 'verified', 'flagged_for_dispute', 'completed', 'complaint_filed', 'disputed', 'pending_release_of_funds', 'buyer_disputed'],
-            example: 'posted',
-            description: 'State machine: posted→assigned→submitted→verified|flagged_for_dispute→completed|pending_release_of_funds|buyer_disputed. Worker can request release if flagged_for_dispute.',
+            enum: ['open', 'shortlisted', 'applications_open', 'selection_in_progress', 'assigned', 'submitted', 'verified', 'flagged_for_dispute', 'completed', 'complaint_filed', 'disputed', 'pending_release_of_funds', 'buyer_disputed'],
+            example: 'open',
+            description: 'State machine: open→shortlisted→applications_open→selection_in_progress→assigned→submitted→verified|flagged_for_dispute→completed|buyer_disputed.',
           },
           task_location: { type: 'string', example: 'Ikeja, Lagos' },
           location_latitude: { type: 'number', example: 6.6018 },
@@ -85,7 +85,12 @@ const openapiSpec = {
               notes: { type: 'string', example: 'Upload before photos of the workspace to compare with after completion.' }
             }
           },
+          buyer_user_id: { type: 'integer', nullable: true, example: 1 },
+          shortlisted_workers: { type: 'array', items: { type: 'integer' }, example: [1, 2, 3] },
+          selected_worker_id: { type: 'integer', nullable: true, example: 3 },
           assigned_worker_id: { type: 'integer', nullable: true, example: 3 },
+          buyer_confirmed: { type: 'boolean', example: false },
+          worker_confirmed: { type: 'boolean', example: false },
           assigned_at: { type: 'string', format: 'date-time', nullable: true },
           proof_submission: { type: 'object', nullable: true },
           submitted_at: { type: 'string', format: 'date-time', nullable: true },
@@ -276,6 +281,64 @@ const openapiSpec = {
         },
       },
       AssignWorkerRequest: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['worker_id'],
+              properties: {
+                worker_id: { type: 'number', example: 3 },
+              },
+            },
+          },
+        },
+      },
+      ShortlistWorkersRequest: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['worker_ids'],
+              properties: {
+                worker_ids: { type: 'array', items: { type: 'integer' }, example: [1, 2, 3] },
+              },
+            },
+          },
+        },
+      },
+      ApplyTaskRequest: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['worker_id', 'proposed_price'],
+              properties: {
+                worker_id: { type: 'number', example: 3 },
+                proposed_price: { type: 'number', example: 20000 },
+                message: { type: 'string', example: 'I can do this job perfectly.' },
+              },
+            },
+          },
+        },
+      },
+      ConfirmWorkerRequest: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['worker_id'],
+              properties: {
+                worker_id: { type: 'number', example: 3 },
+              },
+            },
+          },
+        },
+      },
+      AcceptAssignmentRequest: {
         required: true,
         content: {
           'application/json': {
@@ -489,7 +552,8 @@ const openapiSpec = {
       },
       post: {
         tags: ['Tasks'],
-        summary: 'Create a task (public, generates AI worker matches)',
+        summary: 'Create a task (Buyer/Admin)',
+        security: [{ BearerAuth: [] }],
         requestBody: { $ref: '#/components/requestBodies/CreateTaskRequest' },
         responses: {
           201: {
@@ -515,14 +579,100 @@ const openapiSpec = {
     '/api/v1/tasks/{id}': {
       get: {
         tags: ['Tasks'],
-        summary: 'Get a task by ID (public read)',
+        summary: 'Get a task by ID (Authenticated user associated with task)',
+        security: [{ BearerAuth: [] }],
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         responses: {
           200: { description: 'Task found', content: { 'application/json': { schema: { $ref: '#/components/schemas/Task' } } } },
+          403: { description: 'Not authorized for this task', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
+    },
+
+    '/api/v1/tasks/{id}/shortlist': {
+      post: {
+        tags: ['Tasks'],
+        summary: 'Buyer shortlists workers from AI recommendations',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { $ref: '#/components/requestBodies/ShortlistWorkersRequest' },
+        responses: {
+          200: { description: 'Workers shortlisted successfully' },
+          400: { description: 'Worker IDs array is required' },
+          403: { description: 'Not authorized for this task' },
+          404: { description: 'Task not found' },
+          500: { description: 'Server error' }
+        }
+      }
+    },
+
+    '/api/v1/tasks/{id}/apply': {
+      post: {
+        tags: ['Tasks'],
+        summary: 'Worker applies for a shortlisted task',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { $ref: '#/components/requestBodies/ApplyTaskRequest' },
+        responses: {
+          201: { description: 'Application submitted successfully' },
+          400: { description: 'Worker ID and proposed price are required' },
+          403: { description: 'Worker is not shortlisted or not authorized' },
+          404: { description: 'Task not found' },
+          409: { description: 'Worker has already applied' },
+          500: { description: 'Server error' }
+        }
+      }
+    },
+
+    '/api/v1/tasks/{id}/confirm-worker': {
+      post: {
+        tags: ['Tasks'],
+        summary: 'Buyer confirms a worker from applications',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { $ref: '#/components/requestBodies/ConfirmWorkerRequest' },
+        responses: {
+          200: { description: 'Worker confirmed by buyer' },
+          400: { description: 'Another worker has already been confirmed by the buyer' },
+          403: { description: 'Not authorized for this task' },
+          404: { description: 'Task not found' },
+          500: { description: 'Server error' }
+        }
+      }
+    },
+
+    '/api/v1/tasks/{id}/accept-assignment': {
+      post: {
+        tags: ['Tasks'],
+        summary: 'Worker accepts assignment and generates Escrow',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { $ref: '#/components/requestBodies/AcceptAssignmentRequest' },
+        responses: {
+          200: { description: 'Task fully assigned and escrow created', content: { 'application/json': { schema: { type: 'object', properties: { task: { $ref: '#/components/schemas/Task' }, escrow: { $ref: '#/components/schemas/EscrowAccount' } } } } } },
+          400: { description: 'Buyer has not confirmed this worker yet or task already assigned' },
+          403: { description: 'Worker is not the selected worker for this task' },
+          404: { description: 'Task not found' },
+          500: { description: 'Server error' }
+        }
+      }
+    },
+
+    '/api/v1/tasks/{id}/recommend-final': {
+      post: {
+        tags: ['Tasks'],
+        summary: 'Optional Advanced AI to recommend best applicant',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: {
+          200: { description: 'Best choice recommended' },
+          400: { description: 'No applications found' },
+          404: { description: 'Task not found' },
+          500: { description: 'Server error' }
+        }
+      }
     },
 
     '/api/v1/tasks/{id}/assign': {
@@ -557,6 +707,7 @@ const openapiSpec = {
       post: {
         tags: ['Tasks'],
         summary: 'Submit task completion proof (triggers AI verification)',
+        security: [{ BearerAuth: [] }],
         description: 'Worker submits proof files and optional text. Deterministic checks verify file presence and GPS proximity, then AI Decision Synthesizer evaluates against deliverable_spec. If verified, a 24-hour complaint window opens before auto-payment release.',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         requestBody: { $ref: '#/components/requestBodies/SubmitProofRequest' },
@@ -580,6 +731,7 @@ const openapiSpec = {
       get: {
         tags: ['Tasks'],
         summary: 'Get task status and timeline',
+        security: [{ BearerAuth: [] }],
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         responses: {
           200: {
@@ -609,6 +761,7 @@ const openapiSpec = {
       post: {
         tags: ['Tasks'],
         summary: 'File a complaint on a verified task',
+        security: [{ BearerAuth: [] }],
         description: 'Legacy public complaint endpoint for tasks that are in the verified state and still inside the 24-hour dispute window.',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         requestBody: { $ref: '#/components/requestBodies/ComplaintRequest' },
@@ -638,6 +791,7 @@ const openapiSpec = {
       post: {
         tags: ['Tasks'],
         summary: 'File a manual dispute for an AI-flagged task',
+        security: [{ BearerAuth: [] }],
         description: 'Legacy public dispute endpoint for tasks that were flagged_for_dispute by the AI. The request body may include a message for audit context.',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         requestBody: { $ref: '#/components/requestBodies/DisputeRequest' },

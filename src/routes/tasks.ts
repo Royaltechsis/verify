@@ -8,6 +8,7 @@ import { processTaskOutcome } from '../services/financial-intelligence';
 import { WalletService } from '../services/wallet-service';
 
 import type { Task } from '../types';
+import { authenticate, requireRole } from '../middleware/auth';
 
 const router = Router();
 
@@ -60,7 +61,17 @@ router.get('/:id', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    return res.json(result.rows[0]);
+    const task = result.rows[0];
+    /* const isAssociated = req.user?.role === 'admin' 
+      || task.buyer_user_id === req.user?.id 
+      || task.assigned_worker_id === req.user?.worker_id
+      || (task.shortlisted_workers && task.shortlisted_workers.includes(req.user?.worker_id));
+
+    if (!isAssociated) {
+      return res.status(403).json({ error: 'You are not authorized to view this task' });
+    } */
+
+    return res.json(task);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     console.error('[Tasks] Error fetching task:', errorMessage);
@@ -77,7 +88,7 @@ const parseTaskCreationUpload = (req: Request, res: Response, next: NextFunction
   }
 };
 
-router.post('/', parseTaskCreationUpload, async (req: Request, res: Response) => {
+router.post('/', authenticate, requireRole('buyer', 'admin'), parseTaskCreationUpload, async (req: Request, res: Response) => {
   try {
     const {
       title,
@@ -121,12 +132,12 @@ router.post('/', parseTaskCreationUpload, async (req: Request, res: Response) =>
     const result = await query(
       `INSERT INTO tasks 
        (task_uuid, title, description, client_name, client_email, required_skills, 
-        amount_naira, task_location, location_latitude, location_longitude, due_date, deliverable_spec)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        amount_naira, task_location, location_latitude, location_longitude, due_date, deliverable_spec, buyer_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING *`,
       [
-        task_uuid, title, description, client_name, client_email, required_skills,
-        amount_naira, task_location, location_latitude, location_longitude, due_date, JSON.stringify(deliverable_spec)
+        task_uuid, title, description, client_name || (req.user as any)?.full_name || 'Anonymous', client_email || req.user?.email, required_skills,
+        amount_naira, task_location, location_latitude, location_longitude, due_date, JSON.stringify(deliverable_spec), req.user?.id
       ]
     );
 
@@ -146,7 +157,7 @@ router.post('/', parseTaskCreationUpload, async (req: Request, res: Response) =>
 });
 
 // Shortlist workers
-router.post('/:id/shortlist', async (req: Request, res: Response) => {
+router.post('/:id/shortlist', authenticate, requireRole('buyer', 'admin'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { worker_ids } = req.body;
@@ -158,6 +169,9 @@ router.post('/:id/shortlist', async (req: Request, res: Response) => {
     const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
     if (taskResult.rows.length === 0) {
       return res.status(404).json({ error: 'Task not found' });
+    }
+    if (req.user?.role !== 'admin' && taskResult.rows[0].buyer_user_id !== req.user?.id) {
+      return res.status(403).json({ error: 'Not authorized for this task' });
     }
 
     const result = await query(
@@ -178,7 +192,7 @@ router.post('/:id/shortlist', async (req: Request, res: Response) => {
 });
 
 // Worker applies for a task
-router.post('/:id/apply', async (req: Request, res: Response) => {
+router.post('/:id/apply', authenticate, requireRole('worker'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { worker_id, proposed_price, message } = req.body;
@@ -190,6 +204,9 @@ router.post('/:id/apply', async (req: Request, res: Response) => {
     const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
     if (taskResult.rows.length === 0) {
       return res.status(404).json({ error: 'Task not found' });
+    }
+    if (req.user?.role !== 'admin' && Number(worker_id) !== req.user?.worker_id) {
+      return res.status(403).json({ error: 'Not authorized for this worker profile' });
     }
 
     const task = taskResult.rows[0];
@@ -226,7 +243,7 @@ router.post('/:id/apply', async (req: Request, res: Response) => {
 });
 
 // Buyer selects final worker
-router.post('/:id/confirm-worker', async (req: Request, res: Response) => {
+router.post('/:id/confirm-worker', authenticate, requireRole('buyer', 'admin'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { worker_id } = req.body;
@@ -238,6 +255,9 @@ router.post('/:id/confirm-worker', async (req: Request, res: Response) => {
     const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
     if (taskResult.rows.length === 0) {
       return res.status(404).json({ error: 'Task not found' });
+    }
+    if (req.user?.role !== 'admin' && taskResult.rows[0].buyer_user_id !== req.user?.id) {
+      return res.status(403).json({ error: 'Not authorized for this task' });
     }
     
     const task = taskResult.rows[0];
@@ -263,7 +283,7 @@ router.post('/:id/confirm-worker', async (req: Request, res: Response) => {
 });
 
 // Worker accepts assignment
-router.post('/:id/accept-assignment', async (req: Request, res: Response) => {
+router.post('/:id/accept-assignment', authenticate, requireRole('worker'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { worker_id } = req.body; // Usually from auth context, but taking from body for now
@@ -274,6 +294,9 @@ router.post('/:id/accept-assignment', async (req: Request, res: Response) => {
     }
 
     let task = taskResult.rows[0];
+    if (req.user?.role !== 'admin' && task.selected_worker_id !== req.user?.worker_id) {
+      return res.status(403).json({ error: 'Not authorized for this task' });
+    }
     
     if (task.selected_worker_id !== worker_id) {
       return res.status(403).json({ error: 'Worker is not the selected worker for this task' });
@@ -311,13 +334,16 @@ router.post('/:id/accept-assignment', async (req: Request, res: Response) => {
 });
 
 // Recommend Final Worker (Optional Advanced AI)
-router.post('/:id/recommend-final', async (req: Request, res: Response) => {
+router.post('/:id/recommend-final', authenticate, requireRole('buyer', 'admin'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     
     const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
     if (taskResult.rows.length === 0) {
       return res.status(404).json({ error: 'Task not found' });
+    }
+    if (req.user?.role !== 'admin' && taskResult.rows[0].buyer_user_id !== req.user?.id) {
+      return res.status(403).json({ error: 'Not authorized for this task' });
     }
     
     const applicationsResult = await query(
@@ -350,17 +376,22 @@ router.post('/:id/recommend-final', async (req: Request, res: Response) => {
 });
 
 // Submit task completion proof
-router.post('/:id/submit-proof', upload.array('files', 3), async (req: Request, res: Response) => {
+router.post('/:id/submit-proof', authenticate, requireRole('worker'), upload.array('files', 3), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { text } = req.body;
     
-    // Access files via req.files
     const files = req.files as Express.Multer.File[];
     let fileUrls: string[] = [];
     
     if (files) {
       fileUrls = files.map(f => `http://localhost:${process.env.PORT || 3001}/uploads/${f.filename}`);
+    }
+
+    const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
+    if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    if (req.user?.role !== 'admin' && taskResult.rows[0].assigned_worker_id !== req.user?.worker_id) {
+      return res.status(403).json({ error: 'Not authorized for this task' });
     }
 
     const proof_submission = {
@@ -481,12 +512,15 @@ router.post('/:id/submit-proof', upload.array('files', 3), async (req: Request, 
 });
 
 // File a complaint over AI verification bounds (legacy – use /api/v1/buyer/tasks/:id/dispute for auth'd flow)
-router.post('/:id/complaint', async (req: Request, res: Response) => {
+router.post('/:id/complaint', authenticate, requireRole('buyer', 'admin'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
     const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
     if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    if (req.user?.role !== 'admin' && taskResult.rows[0].buyer_user_id !== req.user?.id) {
+      return res.status(403).json({ error: 'Not authorized for this task' });
+    }
     
     const task = taskResult.rows[0];
 
@@ -519,13 +553,16 @@ router.post('/:id/complaint', async (req: Request, res: Response) => {
 });
 
 // Manually dispute a low flag
-router.post('/:id/dispute', async (req: Request, res: Response) => {
+router.post('/:id/dispute', authenticate, requireRole('worker', 'buyer', 'admin'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { message: _message } = req.body;
 
     const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
     if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
+    if (req.user?.role !== 'admin' && taskResult.rows[0].assigned_worker_id !== req.user?.worker_id) {
+      return res.status(403).json({ error: 'Not authorized for this task' });
+    }
 
     if (taskResult.rows[0].status !== 'flagged_for_dispute') {
       return res.status(400).json({ error: 'Only tasks flagged by AI as low can be manually disputed' });
@@ -544,7 +581,7 @@ router.post('/:id/dispute', async (req: Request, res: Response) => {
 });
 
 // Get task status
-router.get('/:id/status', async (req: Request, res: Response) => {
+router.get('/:id/status', authenticate, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const result = await query(
