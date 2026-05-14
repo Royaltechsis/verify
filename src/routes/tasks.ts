@@ -9,6 +9,7 @@ import { WalletService } from '../services/wallet-service';
 
 import type { Task } from '../types';
 import { authenticate, requireRole } from '../middleware/auth';
+import { NotificationService } from '../services/notification-service';
 
 const router = Router();
 
@@ -180,8 +181,21 @@ router.post('/:id/shortlist', authenticate, requireRole('buyer', 'admin'), async
       [JSON.stringify(worker_ids), id]
     );
 
+    const task = result.rows[0];
+
+    // Notify shortlisted workers
+    worker_ids.forEach((workerId: number) => {
+      NotificationService.notifyWorker(
+        workerId,
+        'You have been shortlisted',
+        `You have been shortlisted for task: ${task.title}. You can now submit an application.`,
+        'task_update',
+        { taskId: id }
+      );
+    });
+
     return res.json({
-      task: result.rows[0],
+      task,
       message: 'Workers shortlisted successfully'
     });
   } catch (error) {
@@ -228,6 +242,17 @@ router.post('/:id/apply', authenticate, requireRole('worker'), async (req: Reque
       await query(`UPDATE tasks SET status = 'applications_open' WHERE id = $1`, [id]);
     }
 
+    // Notify buyer
+    if (task.buyer_user_id) {
+      NotificationService.createNotification(
+        task.buyer_user_id,
+        'New Task Application',
+        `A worker has applied for your task: ${task.title}. Proposed price: ₦${proposed_price}`,
+        'task_update',
+        { taskId: id }
+      );
+    }
+
     return res.status(201).json({
       application: result.rows[0],
       message: 'Application submitted successfully'
@@ -269,6 +294,15 @@ router.post('/:id/confirm-worker', authenticate, requireRole('buyer', 'admin'), 
       `UPDATE tasks SET selected_worker_id = $1, buyer_confirmed = true, status = 'selection_in_progress'
        WHERE id = $2 RETURNING *`,
       [worker_id, id]
+    );
+
+    // Notify worker
+    NotificationService.notifyWorker(
+      worker_id,
+      'You were selected!',
+      `The buyer selected you for task: ${task.title}. Please review and accept the assignment to begin work.`,
+      'task_update',
+      { taskId: id }
     );
 
     return res.json({
@@ -320,6 +354,17 @@ router.post('/:id/accept-assignment', authenticate, requireRole('worker'), async
        WHERE id = $3 RETURNING *`,
       [worker_id, escrow.squad_va_number, id]
     );
+
+    // Notify buyer
+    if (task.buyer_user_id) {
+      NotificationService.createNotification(
+        task.buyer_user_id,
+        'Task Assigned & Escrow Created',
+        `The worker accepted the assignment for: ${task.title}. An escrow account has been created for the payment.`,
+        'escrow_update',
+        { taskId: id }
+      );
+    }
 
     return res.json({
       task: result.rows[0],
@@ -493,6 +538,17 @@ router.post('/:id/submit-proof', authenticate, requireRole('worker'), upload.arr
           console.error(`[Tasks] Error auto-releasing payment for task ${id}:`, err);
         }
       }, WINDOW_MS);
+    }
+
+    // Notify buyer about the proof submission
+    if (task.buyer_user_id) {
+      NotificationService.createNotification(
+        task.buyer_user_id,
+        'Task Proof Submitted',
+        `Proof submitted for task: ${task.title}. AI verification result: ${status === 'verified' ? 'Passed' : 'Flagged'}`,
+        'task_update',
+        { taskId: id }
+      );
     }
 
     return res.json({

@@ -19,11 +19,26 @@ const openapiSpec = {
     { name: 'Workers', description: 'Worker profiles and stats (public read)' },
     { name: 'Worker Profile', description: 'Authenticated worker self-service — KYC, credit score, loans, insurance (Bearer token required)' },
     { name: 'Admin', description: 'Admin-only management endpoints (Bearer token + admin role required)' },
+    { name: 'Notifications', description: 'System notifications and broadcasts (Bearer token required)' },
     { name: 'Webhooks', description: 'Squad and verification webhook callbacks' },
     { name: 'Mock Squad', description: 'Local mock of Squad payment API (non-production only)' },
   ],
   components: {
     schemas: {
+      Notification: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer', example: 1 },
+          user_id: { type: 'integer', nullable: true, example: 42 },
+          title: { type: 'string', example: 'You have been shortlisted' },
+          message: { type: 'string', example: 'You have been shortlisted for task: Office Cleaning.' },
+          type: { type: 'string', example: 'task_update' },
+          is_read: { type: 'boolean', example: false },
+          target_role: { type: 'string', nullable: true, example: 'worker' },
+          metadata: { type: 'object', example: { taskId: 123 } },
+          created_at: { type: 'string', format: 'date-time' },
+        },
+      },
       Worker: {
         type: 'object',
         properties: {
@@ -1811,6 +1826,40 @@ const openapiSpec = {
           { name: 'limit', in: 'query', schema: { type: 'integer', default: 50 } },
         ],
         responses: { 200: { description: 'Audit log entries' } } },
+    },
+    // ────────────────────────────────────────────────────────────────────────
+    // NOTIFICATIONS
+    // ────────────────────────────────────────────────────────────────────────
+    '/api/v1/notifications': {
+      get: { tags: ['Notifications'], summary: 'Get user notifications', security: [{ BearerAuth: [] }],
+        parameters: [
+          { name: 'limit', in: 'query', schema: { type: 'integer', default: 50 } },
+          { name: 'offset', in: 'query', schema: { type: 'integer', default: 0 } },
+        ],
+        responses: { 200: { description: 'List of notifications', content: { 'application/json': { schema: { type: 'array', items: { $ref: '#/components/schemas/Notification' } } } } } } },
+    },
+    '/api/v1/notifications/{id}/read': {
+      post: { tags: ['Notifications'], summary: 'Mark single notification as read', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Notification marked as read' } } },
+    },
+    '/api/v1/notifications/read-all': {
+      post: { tags: ['Notifications'], summary: 'Mark all notifications as read', security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'All notifications marked as read' } } },
+    },
+    '/api/v1/notifications/broadcast': {
+      post: { tags: ['Notifications'], summary: 'Broadcast a notification (Admin only)', security: [{ BearerAuth: [] }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['title', 'message'], properties: {
+          title: { type: 'string' }, message: { type: 'string' }, targetRole: { type: 'string', enum: ['buyer', 'worker', 'admin', 'all'] },
+        }}}}},
+        responses: { 200: { description: 'Broadcast sent' } } },
+    },
+    '/api/v1/notifications/send': {
+      post: { tags: ['Notifications'], summary: 'Send targeted notification (Admin only)', security: [{ BearerAuth: [] }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['userId', 'title', 'message'], properties: {
+          userId: { type: 'integer' }, title: { type: 'string' }, message: { type: 'string' }, type: { type: 'string' }, metadata: { type: 'object' },
+        }}}}},
+        responses: { 200: { description: 'Notification sent' } } },
     },
   },
 };

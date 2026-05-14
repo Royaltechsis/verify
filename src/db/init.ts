@@ -147,6 +147,21 @@ async function initializeDatabase(): Promise<void> {
       )
     `);
 
+    // Notifications table
+    await query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        title VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        type VARCHAR(50) NOT NULL,
+        is_read BOOLEAN DEFAULT FALSE,
+        target_role VARCHAR(50),
+        metadata JSONB DEFAULT '{}'::jsonb,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
     console.log('[DB] All tables created successfully');
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
