@@ -35,7 +35,7 @@ export interface Task {
   client_email?: string;
   required_skills: string[];
   amount_naira: number;
-  status: 'posted' | 'assigned' | 'submitted' | 'verified' | 'funded' | 'completed' | 'disputed' | 'cancelled' | 'flagged_for_dispute' | 'pending_release_of_funds' | 'complaint_filed' | 'buyer_disputed';
+  status: 'open' | 'shortlisted' | 'applications_open' | 'selection_in_progress' | 'assigned' | 'submitted' | 'verified' | 'funded' | 'completed' | 'disputed' | 'cancelled' | 'flagged_for_dispute' | 'pending_release_of_funds' | 'complaint_filed' | 'buyer_disputed';
   task_location: string;
   location_latitude: number;
   location_longitude: number;
@@ -49,6 +49,10 @@ export interface Task {
   verified_at?: string;
   squad_va_account_number?: string;
   squad_payment_ref?: string;
+  shortlisted_workers?: any;
+  selected_worker_id?: number;
+  buyer_confirmed?: boolean;
+  worker_confirmed?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -88,7 +92,11 @@ export interface WorkerMatch {
   worker_id: number;
   name: string;
   match_score: number;
-  reasons: string[];
+  rank?: number;
+  recommendation_reason?: string;
+  strengths?: string[];
+  risks?: string[];
+  confidence?: number;
   distance_km: number;
 }
 

@@ -145,8 +145,88 @@ router.post('/', parseTaskCreationUpload, async (req: Request, res: Response) =>
   }
 });
 
-// Assign worker to task
-router.post('/:id/assign', async (req: Request, res: Response) => {
+// Shortlist workers
+router.post('/:id/shortlist', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { worker_ids } = req.body;
+
+    if (!Array.isArray(worker_ids) || worker_ids.length === 0) {
+      return res.status(400).json({ error: 'Worker IDs array is required' });
+    }
+
+    const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    const result = await query(
+      `UPDATE tasks SET shortlisted_workers = $1, status = 'shortlisted'
+       WHERE id = $2 RETURNING *`,
+      [JSON.stringify(worker_ids), id]
+    );
+
+    return res.json({
+      task: result.rows[0],
+      message: 'Workers shortlisted successfully'
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('[Tasks] Error shortlisting workers:', errorMessage);
+    return res.status(500).json({ error: 'Failed to shortlist workers' });
+  }
+});
+
+// Worker applies for a task
+router.post('/:id/apply', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { worker_id, proposed_price, message } = req.body;
+
+    if (!worker_id || !proposed_price) {
+      return res.status(400).json({ error: 'Worker ID and proposed price are required' });
+    }
+
+    const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    const task = taskResult.rows[0];
+    const shortlistedWorkers = task.shortlisted_workers || [];
+    
+    if (!shortlistedWorkers.includes(worker_id)) {
+      return res.status(403).json({ error: 'Worker is not shortlisted for this task' });
+    }
+
+    const result = await query(
+      `INSERT INTO task_applications (task_id, worker_id, proposed_price, message)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [id, worker_id, proposed_price, message]
+    );
+
+    // Update task status to applications_open if not already
+    if (task.status === 'shortlisted') {
+      await query(`UPDATE tasks SET status = 'applications_open' WHERE id = $1`, [id]);
+    }
+
+    return res.status(201).json({
+      application: result.rows[0],
+      message: 'Application submitted successfully'
+    });
+  } catch (error: any) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'Worker has already applied for this task' });
+    }
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('[Tasks] Error submitting application:', errorMessage);
+    return res.status(500).json({ error: 'Failed to submit application' });
+  }
+});
+
+// Buyer selects final worker
+router.post('/:id/confirm-worker', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { worker_id } = req.body;
@@ -159,33 +239,113 @@ router.post('/:id/assign', async (req: Request, res: Response) => {
     if (taskResult.rows.length === 0) {
       return res.status(404).json({ error: 'Task not found' });
     }
-
-    // Verify worker exists
-    const workerResult = await query('SELECT id FROM workers WHERE id = $1', [worker_id]);
-    if (workerResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Worker not found' });
+    
+    const task = taskResult.rows[0];
+    if (task.selected_worker_id && task.selected_worker_id !== worker_id && task.buyer_confirmed) {
+      return res.status(400).json({ error: 'Another worker has already been confirmed by the buyer' });
     }
 
-    const task = taskResult.rows[0];
+    const result = await query(
+      `UPDATE tasks SET selected_worker_id = $1, buyer_confirmed = true, status = 'selection_in_progress'
+       WHERE id = $2 RETURNING *`,
+      [worker_id, id]
+    );
 
-    // Create Squad escrow account
+    return res.json({
+      task: result.rows[0],
+      message: 'Worker confirmed by buyer'
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('[Tasks] Error confirming worker by buyer:', errorMessage);
+    return res.status(500).json({ error: 'Failed to confirm worker' });
+  }
+});
+
+// Worker accepts assignment
+router.post('/:id/accept-assignment', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { worker_id } = req.body; // Usually from auth context, but taking from body for now
+
+    const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    let task = taskResult.rows[0];
+    
+    if (task.selected_worker_id !== worker_id) {
+      return res.status(403).json({ error: 'Worker is not the selected worker for this task' });
+    }
+    
+    if (!task.buyer_confirmed) {
+      return res.status(400).json({ error: 'Buyer has not confirmed this worker yet' });
+    }
+    
+    if (task.status === 'assigned') {
+      return res.status(400).json({ error: 'Task is already fully assigned' });
+    }
+
+    // Both parties agreed! Update to assigned and create escrow
     const escrow = await createSquadEscrow(task.id, task.amount_naira);
 
-    // Update task with assignment
     const result = await query(
-      `UPDATE tasks SET assigned_worker_id = $1, assigned_at = NOW(), status = 'assigned', squad_va_account_number = $2
+      `UPDATE tasks 
+       SET worker_confirmed = true, assigned_worker_id = $1, assigned_at = NOW(), 
+           status = 'assigned', squad_va_account_number = $2
        WHERE id = $3 RETURNING *`,
       [worker_id, escrow.squad_va_number, id]
     );
 
     return res.json({
       task: result.rows[0],
-      escrow
+      escrow,
+      message: 'Task fully assigned and escrow created'
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error('[Tasks] Error assigning worker:', errorMessage);
-    return res.status(500).json({ error: 'Failed to assign worker' });
+    console.error('[Tasks] Error accepting assignment:', errorMessage);
+    return res.status(500).json({ error: 'Failed to accept assignment' });
+  }
+});
+
+// Recommend Final Worker (Optional Advanced AI)
+router.post('/:id/recommend-final', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    
+    const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    
+    const applicationsResult = await query(
+      `SELECT a.*, w.name, w.trust_score, w.avg_rating 
+       FROM task_applications a 
+       JOIN workers w ON a.worker_id = w.id 
+       WHERE a.task_id = $1`,
+      [id]
+    );
+    
+    if (applicationsResult.rows.length === 0) {
+      return res.status(400).json({ error: 'No applications found for this task' });
+    }
+    
+    // Simulate AI compare applicants logic
+    const applicants = applicationsResult.rows;
+    // Just pick highest trust_score for now
+    const bestChoice = applicants.reduce((prev, current) => (prev.trust_score > current.trust_score) ? prev : current);
+    
+    return res.json({
+      best_choice: bestChoice.worker_id,
+      reason: 'Recommended based on highest trust score among applicants.',
+      risk_notes: ['Ensure proposed price matches budget.']
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('[Tasks] Error recommending final worker:', errorMessage);
+    return res.status(500).json({ error: 'Failed to recommend final worker' });
   }
 });
 

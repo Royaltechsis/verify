@@ -44,7 +44,7 @@ async function initializeDatabase(): Promise<void> {
         client_email VARCHAR(100),
         required_skills TEXT[],
         amount_naira DECIMAL(15, 2) NOT NULL,
-        status VARCHAR(50) DEFAULT 'posted',
+        status VARCHAR(50) DEFAULT 'open',
         task_location VARCHAR(200) NOT NULL,
         location_latitude DECIMAL(10, 8),
         location_longitude DECIMAL(11, 8),

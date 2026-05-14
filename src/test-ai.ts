@@ -85,12 +85,14 @@ async function testWorkerMatching(taskId: number) {
     console.log(`\n${D}  Ranked matches:${X}`);
     matches.forEach((m, i) => {
       console.log(`  ${i + 1}. ${W}${m.name}${X}  score=${m.match_score}  dist=${m.distance_km}km`);
-      m.reasons.forEach(r => console.log(`     ${D}${r}${X}`));
+      if (m.recommendation_reason) console.log(`     ${D}${m.recommendation_reason}${X}`);
+      if (m.strengths) console.log(`     ${D}Strengths: ${m.strengths.join(', ')}${X}`);
+      if (m.risks) console.log(`     ${D}Risks: ${m.risks.join(', ')}${X}`);
     });
 
     pass(`Returned ${matches.length} ranked matches`);
     const top = matches[0];
-    if (top.reasons.some(r => r.includes('Fallback'))) {
+    if (top.recommendation_reason?.includes('Fallback') || top.risks?.some(r => r.includes('Fallback'))) {
       console.log(`${Y}  ⚠  AI synthesis fell back to deterministic (check GEMINI_API_KEY)${X}`);
     } else {
       pass('Gemini reasoning present in top match');
@@ -220,7 +222,7 @@ async function testAuditLog() {
   section('Test 5 — Audit Log (decision_synthesis_logs)');
   try {
     const res = await query(
-      `SELECT type, output_data->>'selected_worker_id' as worker, output_data->>'confidence' as confidence, created_at
+      `SELECT type, output_data->'recommended_workers'->0->>'worker_id' as worker, output_data->'recommended_workers'->0->>'confidence' as confidence, created_at
        FROM decision_synthesis_logs
        ORDER BY created_at DESC LIMIT 5`
     );

@@ -266,14 +266,14 @@ Return this exact JSON shape:
   try {
     const raw = await callLLM(MATCHING_SYSTEM, userPrompt);
     const synthesized: SynthesisOutput = JSON.parse(extractJSON(raw));
-    console.log(`[DecisionSynthesizer] Matched → worker ${synthesized.selected_worker_id} (confidence: ${synthesized.confidence})`);
+    const topWorker = synthesized.recommended_workers?.[0];
+    console.log(`[DecisionSynthesizer] Matched → worker ${topWorker?.worker_id} (confidence: ${topWorker?.confidence})`);
     await logSynthesisDecision('matching', input, synthesized);
     return synthesized;
   } catch (error) {
     console.error('[DecisionSynthesizer] Synthesis failed — falling back to deterministic ranking:', error instanceof Error ? error.message : error);
 
     const sorted = [...input.candidates].sort((a, b) => b.match_score - a.match_score);
-    const top = sorted[0];
     const fallback: SynthesisOutput = {
       recommended_workers: sorted.map((c, idx) => ({
         worker_id: c.worker_id.toString(),
