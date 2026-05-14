@@ -50,6 +50,7 @@ async function initializeDatabase(): Promise<void> {
         location_longitude DECIMAL(11, 8),
         due_date TIMESTAMP NOT NULL,
         deliverable_spec JSONB NOT NULL,
+        ai_recommendations JSONB,
         assigned_worker_id INTEGER REFERENCES workers(id),
         assigned_at TIMESTAMP,
         proof_submission JSONB,

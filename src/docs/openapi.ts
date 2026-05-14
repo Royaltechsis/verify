@@ -14,7 +14,7 @@ const openapiSpec = {
   tags: [
     { name: 'Health', description: 'Service health checks' },
     { name: 'Auth', description: 'Registration, login, JWT tokens' },
-    { name: 'Tasks', description: 'Task lifecycle — post, assign, verify (public)' },
+    { name: 'Tasks', description: 'Task lifecycle — post, assign, verify (authenticated, role-aware visibility)' },
     { name: 'Buyer', description: 'Authenticated buyer operations (Bearer token required)' },
     { name: 'Workers', description: 'Worker profiles and stats (public read)' },
     { name: 'Worker Profile', description: 'Authenticated worker self-service — KYC, credit score, loans, insurance (Bearer token required)' },
@@ -100,6 +100,12 @@ const openapiSpec = {
               notes: { type: 'string', example: 'Upload before photos of the workspace to compare with after completion.' }
             }
           },
+          ai_recommendations: {
+            type: 'array',
+            nullable: true,
+            items: { $ref: '#/components/schemas/WorkerMatch' },
+            description: 'Persisted AI-ranked worker recommendations captured at task creation.',
+          },
           buyer_user_id: { type: 'integer', nullable: true, example: 1 },
           shortlisted_workers: { type: 'array', items: { type: 'integer' }, example: [1, 2, 3] },
           selected_worker_id: { type: 'integer', nullable: true, example: 3 },
@@ -143,7 +149,11 @@ const openapiSpec = {
           worker_id: { type: 'integer', example: 3 },
           name: { type: 'string', example: 'Emeka Nwosu' },
           match_score: { type: 'number', example: 92 },
-          reasons: { type: 'array', items: { type: 'string' } },
+          rank: { type: 'integer', example: 1 },
+          recommendation_reason: { type: 'string', example: 'Strong skill match and high trust score for this task.' },
+          strengths: { type: 'array', items: { type: 'string' }, example: ['Near task location', 'Excellent completion history'] },
+          risks: { type: 'array', items: { type: 'string' }, example: ['Higher than average quoted price'] },
+          confidence: { type: 'number', example: 0.91 },
           distance_km: { type: 'number', example: 3.4 },
         },
       },
@@ -548,7 +558,9 @@ const openapiSpec = {
     '/api/v1/tasks': {
       get: {
         tags: ['Tasks'],
-        summary: 'List all tasks (public read)',
+        summary: 'List tasks related to authenticated user',
+        description: 'Role-aware visibility: buyers see only their own tasks, workers see only tasks tied to them (assigned/selected/shortlisted/applied), admins see all.',
+        security: [{ BearerAuth: [] }],
         parameters: [
           { name: 'status', in: 'query', schema: { type: 'string' }, required: false, description: 'Filter by status (posted, assigned, verified, etc.)' },
           { name: 'location', in: 'query', schema: { type: 'string' }, required: false, description: 'Filter by location (case-insensitive substring match)' },
@@ -562,6 +574,7 @@ const openapiSpec = {
               },
             },
           },
+          401: { description: 'Unauthorized', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
@@ -572,7 +585,7 @@ const openapiSpec = {
         requestBody: { $ref: '#/components/requestBodies/CreateTaskRequest' },
         responses: {
           201: {
-            description: 'Task created successfully with AI worker matches',
+            description: 'Task created successfully with AI worker matches persisted on task.ai_recommendations',
             content: {
               'application/json': {
                 schema: {
@@ -594,13 +607,14 @@ const openapiSpec = {
     '/api/v1/tasks/{id}': {
       get: {
         tags: ['Tasks'],
-        summary: 'Get a task by ID (Authenticated user associated with task)',
+        summary: 'Get a task by ID (only if related to authenticated user)',
+        description: 'Returns task only when the user is permitted by role-based visibility rules; unauthorized access is returned as not found.',
         security: [{ BearerAuth: [] }],
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         responses: {
           200: { description: 'Task found', content: { 'application/json': { schema: { $ref: '#/components/schemas/Task' } } } },
-          403: { description: 'Not authorized for this task', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
-          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          401: { description: 'Unauthorized', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Task not found (or not visible to current user)', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },

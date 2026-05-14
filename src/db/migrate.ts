@@ -33,6 +33,7 @@ async function runMigrations(): Promise<void> {
         ADD COLUMN IF NOT EXISTS admin_resolution TEXT,
         ADD COLUMN IF NOT EXISTS admin_resolved_at TIMESTAMP,
         ADD COLUMN IF NOT EXISTS admin_resolved_by INTEGER REFERENCES users(id),
+        ADD COLUMN IF NOT EXISTS ai_recommendations JSONB,
         ADD COLUMN IF NOT EXISTS shortlisted_workers JSONB,
         ADD COLUMN IF NOT EXISTS selected_worker_id INTEGER REFERENCES workers(id),
         ADD COLUMN IF NOT EXISTS buyer_confirmed BOOLEAN DEFAULT false,

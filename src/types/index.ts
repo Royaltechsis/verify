@@ -41,6 +41,7 @@ export interface Task {
   location_longitude: number;
   due_date: string;
   deliverable_spec: any;
+  ai_recommendations?: any;
   assigned_worker_id?: number;
   assigned_at?: string;
   proof_submission?: any;

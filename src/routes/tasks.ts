@@ -23,26 +23,68 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage: storage });
 
+const buildTaskAccessClause = (user: Request['user'], params: any[]): string => {
+  if (!user) {
+    return ' AND 1=0';
+  }
+
+  if (user.role === 'admin') {
+    return '';
+  }
+
+  if (user.role === 'buyer') {
+    params.push(user.id);
+    return ` AND t.buyer_user_id = $${params.length}`;
+  }
+
+  if (user.role === 'worker') {
+    if (!user.worker_id) {
+      return ' AND 1=0';
+    }
+    params.push(user.worker_id);
+    const workerIdParam = params.length;
+    return `
+      AND (
+        t.assigned_worker_id = $${workerIdParam}
+        OR t.selected_worker_id = $${workerIdParam}
+        OR (
+          jsonb_typeof(t.shortlisted_workers) = 'array'
+          AND t.shortlisted_workers @> to_jsonb(ARRAY[$${workerIdParam}]::int[])
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM task_applications ta
+          WHERE ta.task_id = t.id AND ta.worker_id = $${workerIdParam}
+        )
+      )
+    `;
+  }
+
+  return ' AND 1=0';
+};
+
 // Get all tasks
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', authenticate, requireRole('buyer', 'worker', 'admin'), async (req: Request, res: Response) => {
   try {
     const status = req.query.status as string;
     const location = req.query.location as string;
     
-    let sql = 'SELECT * FROM tasks WHERE 1=1';
+    let sql = 'SELECT t.* FROM tasks t WHERE 1=1';
     const params: any[] = [];
 
     if (status) {
-      sql += ' AND status = $' + (params.length + 1);
+      sql += ' AND t.status = $' + (params.length + 1);
       params.push(status);
     }
 
     if (location) {
-      sql += ' AND task_location ILIKE $' + (params.length + 1);
+      sql += ' AND t.task_location ILIKE $' + (params.length + 1);
       params.push(`%${location}%`);
     }
 
-    sql += ' ORDER BY created_at DESC';
+    sql += buildTaskAccessClause(req.user, params);
+
+    sql += ' ORDER BY t.created_at DESC';
     const result = await query(sql, params);
     return res.json(result.rows);
   } catch (error) {
@@ -53,10 +95,13 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 // Get task by ID
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', authenticate, requireRole('buyer', 'worker', 'admin'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const result = await query('SELECT * FROM tasks WHERE id = $1', [id]);
+    const params: any[] = [id];
+    let sql = 'SELECT t.* FROM tasks t WHERE t.id = $1';
+    sql += buildTaskAccessClause(req.user, params);
+    const result = await query(sql, params);
     
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Task not found' });
@@ -145,10 +190,16 @@ router.post('/', authenticate, requireRole('buyer', 'admin'), parseTaskCreationU
     // Get worker matches
     const task = result.rows[0] as Task;
     const matches = await getWorkerMatches(task, 5);
+    const updatedTaskResult = await query(
+      `UPDATE tasks SET ai_recommendations = $1 WHERE id = $2 RETURNING *`,
+      [JSON.stringify(matches), task.id]
+    );
+    const updatedTask = (updatedTaskResult.rows[0] as Task) || task;
+    const persistedRecommendations = (updatedTaskResult.rows[0] as any)?.ai_recommendations;
 
     return res.status(201).json({
-      task,
-      matches
+      task: updatedTask,
+      matches: persistedRecommendations || matches
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
