@@ -74,7 +74,7 @@ const openapiSpec = {
           description: { type: 'string', example: 'Deep clean and sanitize the office space.' },
           client_name: { type: 'string', nullable: true, example: 'TaskVerify Client' },
           client_email: { type: 'string', nullable: true, example: 'client@example.com' },
-          required_skills: { type: 'array', items: { type: 'string' }, example: ['cleaning'] },
+          required_skills: { type: 'array', items: { type: 'string' }, example: ['cleaning', 'painting'], description: 'Array of required skill tags for this task' },
           amount_naira: { type: 'number', example: 25000 },
           status: {
             type: 'string',
@@ -104,7 +104,7 @@ const openapiSpec = {
             type: 'array',
             nullable: true,
             items: { $ref: '#/components/schemas/WorkerMatch' },
-            description: 'Persisted AI-ranked worker recommendations captured at task creation.',
+            description: 'Persisted AI-ranked worker recommendations (top 5 matches). Auto-generated at task creation. Sorted by match_score (highest first). Each match includes skill fit, location distance, and risk analysis.',
           },
           buyer_user_id: { type: 'integer', nullable: true, example: 1 },
           shortlisted_workers: { type: 'array', items: { type: 'integer' }, example: [1, 2, 3] },
@@ -145,16 +145,17 @@ const openapiSpec = {
       },
       WorkerMatch: {
         type: 'object',
+        description: 'AI-ranked worker match candidate. Included in task.ai_recommendations array (top 5 matches per task).',
         properties: {
-          worker_id: { type: 'integer', example: 3 },
-          name: { type: 'string', example: 'Emeka Nwosu' },
-          match_score: { type: 'number', example: 92 },
-          rank: { type: 'integer', example: 1 },
-          recommendation_reason: { type: 'string', example: 'Strong skill match and high trust score for this task.' },
-          strengths: { type: 'array', items: { type: 'string' }, example: ['Near task location', 'Excellent completion history'] },
-          risks: { type: 'array', items: { type: 'string' }, example: ['Higher than average quoted price'] },
-          confidence: { type: 'number', example: 0.91 },
-          distance_km: { type: 'number', example: 3.4 },
+          worker_id: { type: 'integer', example: 3, description: 'Worker ID' },
+          name: { type: 'string', example: 'Emeka Nwosu', description: 'Worker full name' },
+          match_score: { type: 'number', example: 116.64, description: 'Combined match score (skills + location + trust)' },
+          rank: { type: 'integer', example: 1, description: 'Rank position (1 = highest match)' },
+          recommendation_reason: { type: 'string', example: 'Fallback to deterministic engine scores (AI synthesis unavailable).', description: 'Why this worker was recommended' },
+          strengths: { type: 'array', items: { type: 'string' }, example: ['Near task location', 'Excellent completion history'], description: 'Relevant strengths' },
+          risks: { type: 'array', items: { type: 'string' }, example: ['AI synthesis unavailable — manual review recommended.'], description: 'Potential concerns' },
+          confidence: { type: 'number', example: 100, description: 'Confidence level 0-100' },
+          distance_km: { type: 'number', example: 215.78, description: 'Distance to task location in km' },
         },
       },
       TaskVerificationResult: {
@@ -284,7 +285,7 @@ const openapiSpec = {
                 description: { type: 'string', example: 'Deep clean and sanitize the office space.' },
                 client_name: { type: 'string', example: 'TaskVerify Client' },
                 client_email: { type: 'string', format: 'email', example: 'client@example.com' },
-                required_skills: { type: 'array', items: { type: 'string' }, example: ['cleaning'] },
+                required_skills: { type: 'array', items: { type: 'string' }, example: ['cleaning'], description: 'Array of required skill tags for this task' },
                 amount_naira: { type: 'number', example: 25000 },
                 task_location: { type: 'string', example: 'Ikeja, Lagos' },
                 location_latitude: { type: 'number', example: 6.6018 },
@@ -300,6 +301,25 @@ const openapiSpec = {
                   items: { type: 'string', format: 'binary' },
                   description: 'Optional reference images for the deliverable specification.'
                 },
+              },
+            },
+          },
+          'application/json': {
+            schema: {
+              type: 'object',
+              required: ['title', 'description', 'amount_naira', 'task_location', 'due_date', 'deliverable_spec'],
+              properties: {
+                title: { type: 'string', example: 'Office cleaning for 2 rooms' },
+                description: { type: 'string', example: 'Deep clean and sanitize the office space.' },
+                client_name: { type: 'string', example: 'TaskVerify Client' },
+                client_email: { type: 'string', format: 'email', example: 'client@example.com' },
+                required_skills: { type: 'array', items: { type: 'string' }, example: ['cleaning'], description: 'Array of required skill tags. Can also be string (comma-separated) which will be parsed.' },
+                amount_naira: { type: 'number', example: 25000 },
+                task_location: { type: 'string', example: 'Ikeja, Lagos' },
+                location_latitude: { type: 'number', example: 6.6018 },
+                location_longitude: { type: 'number', example: 3.3515 },
+                due_date: { type: 'string', format: 'date-time', example: '2026-05-21T10:00:00Z' },
+                deliverable_spec: { type: 'object', example: { photos_required: true, minimum_photos: 3, notes: 'Upload before photos of the workspace.' }, description: 'Object with deliverable requirements (or JSON string in form-data)' },
               },
             },
           },
@@ -558,8 +578,8 @@ const openapiSpec = {
     '/api/v1/tasks': {
       get: {
         tags: ['Tasks'],
-        summary: 'List tasks related to authenticated user',
-        description: 'Role-aware visibility: buyers see only their own tasks, workers see only tasks tied to them (assigned/selected/shortlisted/applied), admins see all.',
+        summary: 'List tasks related to authenticated user (with AI recommendations)',
+        description: 'Returns tasks visible to the authenticated user based on role and relationship. Role-aware visibility: buyers see only tasks they created, workers see tasks they are assigned/selected/shortlisted/applied to, admins see all. Each task includes persisted ai_recommendations array.',
         security: [{ BearerAuth: [] }],
         parameters: [
           { name: 'status', in: 'query', schema: { type: 'string' }, required: false, description: 'Filter by status (posted, assigned, verified, etc.)' },
@@ -591,8 +611,8 @@ const openapiSpec = {
                 schema: {
                   type: 'object',
                   properties: {
-                    task: { $ref: '#/components/schemas/Task' },
-                    matches: { type: 'array', items: { $ref: '#/components/schemas/WorkerMatch' }, description: 'AI-ranked worker matches' },
+                    task: { $ref: '#/components/schemas/Task', description: 'Created task with ai_recommendations array' },
+                    matches: { type: 'array', items: { $ref: '#/components/schemas/WorkerMatch' }, description: 'AI-ranked worker matches (same as task.ai_recommendations)' },
                   },
                 },
               },
@@ -607,8 +627,8 @@ const openapiSpec = {
     '/api/v1/tasks/{id}': {
       get: {
         tags: ['Tasks'],
-        summary: 'Get a task by ID (only if related to authenticated user)',
-        description: 'Returns task only when the user is permitted by role-based visibility rules; unauthorized access is returned as not found.',
+        summary: 'Get a task by ID with AI recommendations (if related to user)',
+        description: 'Returns full task details including persisted ai_recommendations array. Access is role-aware: buyers see only their own tasks, workers see only assigned/selected/shortlisted/applied tasks, admins see all. Unauthorized users receive 404 (not-found).',
         security: [{ BearerAuth: [] }],
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         responses: {

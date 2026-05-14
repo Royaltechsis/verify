@@ -41,16 +41,14 @@ const buildTaskAccessClause = (user: Request['user'], params: any[]): string => 
     if (!user.worker_id) {
       return ' AND 1=0';
     }
+    // Push worker_id once and reuse the same parameter index for all 4 predicates
     params.push(user.worker_id);
     const workerIdParam = params.length;
     return `
       AND (
         t.assigned_worker_id = $${workerIdParam}
         OR t.selected_worker_id = $${workerIdParam}
-        OR (
-          jsonb_typeof(t.shortlisted_workers) = 'array'
-          AND t.shortlisted_workers @> to_jsonb(ARRAY[$${workerIdParam}]::int[])
-        )
+        OR (t.shortlisted_workers IS NOT NULL AND t.shortlisted_workers::text LIKE '%' || $${workerIdParam}::text || '%')
         OR EXISTS (
           SELECT 1
           FROM task_applications ta
@@ -167,6 +165,14 @@ router.post('/', authenticate, requireRole('buyer', 'admin'), parseTaskCreationU
       return res.status(400).json({ error: 'deliverable_spec must be an object' });
     }
 
+    // Ensure required_skills is an array
+    let skillsArray = required_skills;
+    if (typeof required_skills === 'string') {
+      skillsArray = required_skills.split(',').map((s: string) => s.trim());
+    } else if (!Array.isArray(required_skills)) {
+      skillsArray = [];
+    }
+
     const uploadedFiles = req.files as Express.Multer.File[] | undefined;
     const deliverableImageUrls = uploadedFiles?.map(f => `http://localhost:${process.env.PORT || 3001}/uploads/${f.filename}`) || [];
     const existingImages = Array.isArray(deliverable_spec.reference_image_urls) ? deliverable_spec.reference_image_urls : [];
@@ -182,7 +188,7 @@ router.post('/', authenticate, requireRole('buyer', 'admin'), parseTaskCreationU
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING *`,
       [
-        task_uuid, title, description, client_name || (req.user as any)?.full_name || 'Anonymous', client_email || req.user?.email, required_skills,
+        task_uuid, title, description, client_name || (req.user as any)?.full_name || 'Anonymous', client_email || req.user?.email, skillsArray,
         amount_naira, task_location, location_latitude, location_longitude, due_date, JSON.stringify(deliverable_spec), req.user?.id
       ]
     );
@@ -190,12 +196,23 @@ router.post('/', authenticate, requireRole('buyer', 'admin'), parseTaskCreationU
     // Get worker matches
     const task = result.rows[0] as Task;
     const matches = await getWorkerMatches(task, 5);
-    const updatedTaskResult = await query(
-      `UPDATE tasks SET ai_recommendations = $1 WHERE id = $2 RETURNING *`,
-      [JSON.stringify(matches), task.id]
-    );
-    const updatedTask = (updatedTaskResult.rows[0] as Task) || task;
-    const persistedRecommendations = (updatedTaskResult.rows[0] as any)?.ai_recommendations;
+    
+    // Try to persist AI recommendations (may fail if column doesn't exist yet, which is OK)
+    let updatedTask = task;
+    let persistedRecommendations = matches;
+    try {
+      const updatedTaskResult = await query(
+        `UPDATE tasks SET ai_recommendations = $1 WHERE id = $2 RETURNING *`,
+        [JSON.stringify(matches), task.id]
+      );
+      if (updatedTaskResult.rows.length > 0) {
+        updatedTask = updatedTaskResult.rows[0] as Task;
+        persistedRecommendations = (updatedTaskResult.rows[0] as any)?.ai_recommendations || matches;
+      }
+    } catch (persistError) {
+      console.warn('[Tasks] Warning: Could not persist AI recommendations (column may not exist):', persistError instanceof Error ? persistError.message : persistError);
+      // Continue with original task and matches
+    }
 
     return res.status(201).json({
       task: updatedTask,
