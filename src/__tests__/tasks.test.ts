@@ -5,7 +5,7 @@ import bodyParser from 'body-parser';
 // Mocks
 jest.mock('../db/pool', () => ({ query: jest.fn().mockResolvedValue({ rows: [{ id: 1 }] }) }));
 jest.mock('../middleware/auth', () => ({
-  authenticate: (req: any, _res: any, next: any) => next(),
+  authenticate: (_req: any, _res: any, next: any) => next(),
   requireRole: () => (_req: any, _res: any, next: any) => next(),
   auditLog: jest.fn()
 }));
