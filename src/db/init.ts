@@ -58,8 +58,26 @@ async function initializeDatabase(): Promise<void> {
         verified_at TIMESTAMP,
         squad_va_account_number VARCHAR(20),
         squad_payment_ref VARCHAR(50),
+        shortlisted_workers JSONB,
+        selected_worker_id INTEGER REFERENCES workers(id),
+        buyer_confirmed BOOLEAN DEFAULT false,
+        worker_confirmed BOOLEAN DEFAULT false,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Task Applications table
+    await query(`
+      CREATE TABLE IF NOT EXISTS task_applications (
+        id SERIAL PRIMARY KEY,
+        task_id INTEGER NOT NULL REFERENCES tasks(id),
+        worker_id INTEGER NOT NULL REFERENCES workers(id),
+        proposed_price DECIMAL(15, 2) NOT NULL,
+        message TEXT,
+        status VARCHAR(50) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(task_id, worker_id)
       )
     `);
 
@@ -96,6 +114,35 @@ async function initializeDatabase(): Promise<void> {
         earned_naira DECIMAL(15, 2),
         bonus_for_on_time DECIMAL(15, 2) DEFAULT 0,
         completed_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Wallets table
+    await query(`
+      CREATE TABLE IF NOT EXISTS wallets (
+        id SERIAL PRIMARY KEY,
+        owner_id INTEGER NOT NULL,
+        owner_type VARCHAR(20) NOT NULL,
+        balance DECIMAL(15, 2) DEFAULT 0,
+        locked_balance DECIMAL(15, 2) DEFAULT 0,
+        squad_va_number VARCHAR(20) UNIQUE,
+        squad_bank_code VARCHAR(10),
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // Wallet Transactions history
+    await query(`
+      CREATE TABLE IF NOT EXISTS wallet_transactions (
+        id SERIAL PRIMARY KEY,
+        wallet_id INTEGER REFERENCES wallets(id),
+        type VARCHAR(50),
+        amount DECIMAL(15, 2) NOT NULL,
+        reference VARCHAR(100) UNIQUE,
+        status VARCHAR(50) DEFAULT 'success',
+        task_id INTEGER REFERENCES tasks(id),
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);

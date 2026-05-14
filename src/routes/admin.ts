@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { query } from '../db/pool';
 import { authenticate, requireRole, auditLog } from '../middleware/auth';
+import { WalletService } from '../services/wallet-service';
+import { releaseEscrowToWorker } from '../services/squad-service';
 
 const router = Router();
 
@@ -374,6 +376,193 @@ router.patch('/disputes/:id/resolve', async (req: Request, res: Response) => {
     return res.json({ message: `Dispute resolved: ${resolution}` });
   } catch (error: any) {
     return res.status(500).json({ error: 'Failed to resolve dispute' });
+  }
+});
+
+/**
+ * PATCH /api/v1/admin/tasks/:id/resolve-worker-release-request
+ * Admin endpoint to handle worker requests for fund release when they feel AI rejected unfairly
+ * Body: { decision: 'approve'|'reject', reason }
+ */
+router.patch('/tasks/:id/resolve-worker-release-request', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { decision, reason } = req.body;
+
+    const validDecisions = ['approve', 'reject'];
+    if (!validDecisions.includes(decision)) {
+      return res.status(400).json({ 
+        error: 'Invalid decision', 
+        valid_decisions: validDecisions 
+      });
+    }
+
+    // Get the task with full details
+    const taskResult = await query(
+      `SELECT t.*, w.id AS worker_id, w.name AS worker_name, w.email AS worker_email,
+              e.id AS escrow_id, e.status AS escrow_status, e.amount_naira AS escrow_amount
+       FROM tasks t
+       LEFT JOIN workers w ON w.id = t.assigned_worker_id
+       LEFT JOIN escrow_accounts e ON e.task_id = t.id
+       WHERE t.id = $1`,
+      [id]
+    );
+
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    const task = taskResult.rows[0];
+
+    // Only allow resolution if task is pending_release_of_funds
+    if (task.status !== 'pending_release_of_funds') {
+      return res.status(400).json({
+        error: `Task is not in 'pending_release_of_funds' state`,
+        current_status: task.status,
+      });
+    }
+
+    if (decision === 'approve') {
+      try {
+        // 1. Process wallet transfer: buyer wallet → worker wallet
+        if (task.buyer_user_id && task.worker_id && task.amount_naira) {
+          await WalletService.releaseEscrowToWorker(
+            task.buyer_user_id,
+            task.worker_id,
+            task.amount_naira,
+            task.id
+          );
+        }
+
+        // 2. Attempt Squad escrow release (may fail if Squad is down, but local transfer succeeded)
+        if (task.escrow_id) {
+          try {
+            await releaseEscrowToWorker(task.escrow_id, task.worker_id);
+          } catch (squadError) {
+            console.warn(`[Admin] Squad release failed for escrow ${task.escrow_id}, but local wallet updated:`, squadError);
+            // Continue - wallet already updated locally
+          }
+        }
+
+        // 3. Mark task as completed
+        await query(
+          `UPDATE tasks 
+           SET status = 'completed', 
+               admin_resolved_by = $1, 
+               admin_resolved_at = NOW(),
+               admin_resolution = $2
+           WHERE id = $3`,
+          [req.user!.id, `Admin approved worker fund release request: ${reason || 'AI verification overturned'}`, id]
+        );
+
+        // 4. Update escrow account status to released
+        await query(
+          `UPDATE escrow_accounts 
+           SET status = 'released', 
+               released_to_worker_at = NOW()
+           WHERE task_id = $1`,
+          [id]
+        );
+
+        // 5. Update the associated dispute log entry
+        await query(
+          `UPDATE dispute_logs 
+           SET status = 'resolved_worker', 
+               resolution_note = $1,
+               resolved_by = $2,
+               resolved_at = NOW()
+           WHERE task_id = $3 AND reason LIKE '%Worker request for fund release%'`,
+          [`Admin decision: ${reason || 'Approved worker request for fund release'}`, req.user!.id, id]
+        );
+
+        await auditLog(req.user!.id, 'admin', 'approve_worker_release_request', 'tasks', parseInt(id), {
+          reason: reason || 'Approved worker fund release request',
+          amount_released: task.amount_naira,
+        });
+
+        return res.json({
+          message: 'Worker fund release request APPROVED. Funds have been transferred.',
+          task_id: id,
+          new_status: 'completed',
+          worker_id: task.worker_id,
+          amount_released: task.amount_naira,
+        });
+      } catch (processError: any) {
+        console.error('[Admin] Error processing fund release:', processError.message);
+        return res.status(400).json({
+          error: 'Failed to process fund release',
+          details: processError.message,
+        });
+      }
+    } else {
+      // Reject the request - revert to previous state
+      let revertStatus = 'verified';
+      if (task.ai_verification_result && !task.ai_verification_result.verified) {
+        revertStatus = 'flagged_for_dispute';
+      }
+
+      await query(
+        `UPDATE tasks 
+         SET status = $1, 
+             admin_resolved_by = $2, 
+             admin_resolved_at = NOW(),
+             admin_resolution = $3
+         WHERE id = $4`,
+        [revertStatus, req.user!.id, `Admin rejected worker fund release request: ${reason || 'Did not meet criteria'}`, id]
+      );
+
+      await query(
+        `UPDATE dispute_logs 
+         SET status = 'resolved_buyer', 
+             resolution_note = $1,
+             resolved_by = $2,
+             resolved_at = NOW()
+         WHERE task_id = $3 AND reason LIKE '%Worker request for fund release%'`,
+        [`Admin decision: ${reason || 'Rejected worker request - AI verification stands'}`, req.user!.id, id]
+      );
+
+      await auditLog(req.user!.id, 'admin', 'reject_worker_release_request', 'tasks', parseInt(id), {
+        reason: reason || 'Rejected worker fund release request',
+      });
+
+      return res.json({
+        message: 'Worker fund release request REJECTED. Task reverted to AI verification state.',
+        task_id: id,
+        new_status: revertStatus,
+        worker_id: task.worker_id,
+      });
+    }
+  } catch (error: any) {
+    console.error('[Admin] Error resolving worker release request:', error.message);
+    return res.status(500).json({ error: 'Failed to resolve worker release request' });
+  }
+});
+
+/**
+ * GET /api/v1/admin/pending-release-requests
+ * List all tasks pending worker fund release review
+ */
+router.get('/pending-release-requests', async (_req: Request, res: Response) => {
+  try {
+    const result = await query(
+      `SELECT t.id, t.task_uuid, t.title, t.amount_naira, t.status, t.updated_at,
+              w.name AS worker_name, w.email AS worker_email, w.id AS worker_id,
+              d.reason, d.created_at AS request_created_at
+       FROM tasks t
+       LEFT JOIN workers w ON w.id = t.assigned_worker_id
+       LEFT JOIN dispute_logs d ON d.task_id = t.id AND d.reason LIKE '%Worker request for fund release%'
+       WHERE t.status = 'pending_release_of_funds'
+       ORDER BY t.updated_at DESC`,
+      []
+    );
+
+    return res.json({
+      pending_requests: result.rows,
+      count: result.rows.length,
+    });
+  } catch (error: any) {
+    console.error('[Admin] Error fetching pending release requests:', error.message);
+    return res.status(500).json({ error: 'Failed to fetch pending release requests' });
   }
 });
 

@@ -41,11 +41,17 @@ export interface SynthesisInput {
 }
 
 export interface SynthesisOutput {
-  selected_worker_id: string;
-  ranking: Array<{ worker_id: string; score: number }>;
-  reasoning: string;
-  risk_analysis: string[];
-  confidence: number;
+  recommended_workers: Array<{
+    worker_id: string;
+    rank: number;
+    score: number;
+    recommendation_reason: string;
+    strengths: string[];
+    risks: string[];
+    confidence: number;
+  }>;
+  summary: string;
+  selection_strategy: string;
 }
 
 export interface ProofVerificationInput {
@@ -230,8 +236,8 @@ Your ONLY job is to interpret pre-computed deterministic scores and profiles to 
 Rules:
 - Do NOT alter or invent scores; base ranking strictly on the provided metrics and profiles (especially credit_score, risk_level, and behavioral_score).
 - Return pure JSON, no markdown, no explanation outside the JSON structure.
-- Be concise in "reasoning" — one clear sentence explaining the top pick based on trust and financial identity.
-- "risk_analysis" should list 1-3 specific risk factors derived from the data (fraud_risk, economic_profile risk_level, low trust_score, distance, etc).`;
+- Provide a summary and a selection_strategy.
+- Return top 3-5 candidates in recommended_workers array, each containing: rank, score, recommendation_reason, strengths, risks, confidence.`;
 
 export async function synthesizeDecision(input: SynthesisInput): Promise<SynthesisOutput> {
   const userPrompt = `Task:
@@ -242,11 +248,19 @@ ${JSON.stringify(input.candidates, null, 2)}
 
 Return this exact JSON shape:
 {
-  "selected_worker_id": "<string id of best candidate>",
-  "ranking": [{ "worker_id": "<string>", "score": <number> }],
-  "reasoning": "<one sentence why top candidate was chosen>",
-  "risk_analysis": ["<risk 1>", "<risk 2>"],
-  "confidence": <0-100>
+  "recommended_workers": [
+    {
+      "worker_id": "<string>",
+      "rank": <number>,
+      "score": <number>,
+      "recommendation_reason": "<sentence>",
+      "strengths": ["<strength 1>"],
+      "risks": ["<risk 1>"],
+      "confidence": <0-100>
+    }
+  ],
+  "summary": "<overall summary of candidates>",
+  "selection_strategy": "<advice for the buyer on how to choose>"
 }`;
 
   try {
@@ -261,11 +275,17 @@ Return this exact JSON shape:
     const sorted = [...input.candidates].sort((a, b) => b.match_score - a.match_score);
     const top = sorted[0];
     const fallback: SynthesisOutput = {
-      selected_worker_id: top ? top.worker_id.toString() : '',
-      ranking: sorted.map(c => ({ worker_id: c.worker_id.toString(), score: c.match_score })),
-      reasoning: 'Fallback to deterministic engine scores (AI synthesis unavailable).',
-      risk_analysis: ['AI synthesis unavailable — manual review recommended.'],
-      confidence: 100
+      recommended_workers: sorted.map((c, idx) => ({
+        worker_id: c.worker_id.toString(),
+        rank: idx + 1,
+        score: c.match_score,
+        recommendation_reason: 'Fallback to deterministic engine scores (AI synthesis unavailable).',
+        strengths: [],
+        risks: ['AI synthesis unavailable — manual review recommended.'],
+        confidence: 100
+      })),
+      summary: "Deterministic engine fallback.",
+      selection_strategy: "Manual review of deterministic rankings."
     };
 
     await logSynthesisDecision('matching', input, fallback);
@@ -291,6 +311,8 @@ ${JSON.stringify(input.proof, null, 2)}
 
 Deterministic Pre-check:
 ${JSON.stringify(input.deterministicResult, null, 2)}
+
+If deliverable_spec contains reference_image_urls, compare the submitted proof images against those reference images as part of the visual inspection.
 
 Return this exact JSON shape:
 {

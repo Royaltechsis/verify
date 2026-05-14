@@ -18,7 +18,7 @@ router.post('/register', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'email, password, and full_name are required' });
     }
 
-    if (!['buyer', 'worker'].includes(role)) {
+    if (!['buyer', 'worker', 'admin'].includes(role)) {
       return res.status(400).json({ error: 'role must be "buyer" or "worker"' });
     }
 

@@ -1,10 +1,11 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import { query } from '../db/pool';
 import { v4 as uuidv4 } from 'uuid';
 import { getWorkerMatches, verifyTaskCompletion } from '../services/ai-matching';
-import { createSquadEscrow } from '../services/squad-service';
+import { createSquadEscrow, releaseEscrowToWorker } from '../services/squad-service';
 import { processTaskOutcome } from '../services/financial-intelligence';
+import { WalletService } from '../services/wallet-service';
 
 import type { Task } from '../types';
 
@@ -68,7 +69,15 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 // Create new task
-router.post('/', async (req: Request, res: Response) => {
+const parseTaskCreationUpload = (req: Request, res: Response, next: NextFunction) => {
+  if (req.is('multipart/form-data')) {
+    upload.array('deliverable_images', 5)(req, res, next as any);
+  } else {
+    next();
+  }
+};
+
+router.post('/', parseTaskCreationUpload, async (req: Request, res: Response) => {
   try {
     const {
       title,
@@ -81,12 +90,31 @@ router.post('/', async (req: Request, res: Response) => {
       location_latitude,
       location_longitude,
       due_date,
-      deliverable_spec
-    } = req.body;
+      deliverable_spec: deliverableSpecRaw
+    } = req.body as any;
 
-    // Validate required fields
+    let deliverable_spec = deliverableSpecRaw;
+    if (typeof deliverableSpecRaw === 'string') {
+      try {
+        deliverable_spec = JSON.parse(deliverableSpecRaw);
+      } catch {
+        return res.status(400).json({ error: 'deliverable_spec must be valid JSON' });
+      }
+    }
+
     if (!title || !description || !amount_naira || !task_location || !due_date || !deliverable_spec) {
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    if (typeof deliverable_spec !== 'object') {
+      return res.status(400).json({ error: 'deliverable_spec must be an object' });
+    }
+
+    const uploadedFiles = req.files as Express.Multer.File[] | undefined;
+    const deliverableImageUrls = uploadedFiles?.map(f => `http://localhost:${process.env.PORT || 3001}/uploads/${f.filename}`) || [];
+    const existingImages = Array.isArray(deliverable_spec.reference_image_urls) ? deliverable_spec.reference_image_urls : [];
+    if (deliverableImageUrls.length > 0) {
+      deliverable_spec.reference_image_urls = [...existingImages, ...deliverableImageUrls];
     }
 
     const task_uuid = uuidv4();
@@ -216,22 +244,57 @@ router.post('/:id/submit-proof', upload.array('files', 3), async (req: Request, 
         try {
           // Only release if buyer has NOT disputed within the window
           const checkStatus = await query(
-            'SELECT status, assigned_worker_id, amount_naira FROM tasks WHERE id = $1',
+            `SELECT t.*, e.id AS escrow_id, e.amount_naira, t.buyer_user_id
+             FROM tasks t
+             LEFT JOIN escrow_accounts e ON e.task_id = t.id
+             WHERE t.id = $1`,
             [id]
           );
           if (
             checkStatus.rows.length > 0 &&
             checkStatus.rows[0].status === 'verified'
           ) {
+            const taskData = checkStatus.rows[0];
+            
+            // Process wallet transfer: buyer → worker
+            try {
+              if (taskData.buyer_user_id && parseInt(id) > 0 && taskData.amount_naira) {
+                await WalletService.releaseEscrowToWorker(
+                  taskData.buyer_user_id,
+                  taskData.assigned_worker_id,
+                  taskData.amount_naira,
+                  parseInt(id)
+                );
+              }
+            } catch (walletError) {
+              console.error(`[Tasks] Wallet transfer failed for task ${id}:`, walletError);
+            }
+
+            // Attempt Squad escrow release
+            try {
+              if (taskData.escrow_id && taskData.assigned_worker_id) {
+                await releaseEscrowToWorker(taskData.escrow_id, taskData.assigned_worker_id);
+              }
+            } catch (squadError) {
+              console.warn(`[Tasks] Squad release failed for task ${id}, but local wallet updated:`, squadError);
+            }
+
             // Window elapsed with no buyer dispute -> auto-release
             await query(
               `UPDATE tasks SET status = 'completed', completed_at = NOW() WHERE id = $1`,
               [id]
             );
+            
+            // Update escrow status
+            await query(
+              `UPDATE escrow_accounts SET status = 'released', released_to_worker_at = NOW() WHERE task_id = $1`,
+              [id]
+            );
+            
             await processTaskOutcome(
-              checkStatus.rows[0].assigned_worker_id,
+              taskData.assigned_worker_id,
               true,
-              checkStatus.rows[0].amount_naira
+              taskData.amount_naira
             );
             console.log(`[Tasks] Auto-released payment for task ${id} after dispute window.`);
           }

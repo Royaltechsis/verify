@@ -63,15 +63,28 @@ const openapiSpec = {
           amount_naira: { type: 'number', example: 25000 },
           status: {
             type: 'string',
-            enum: ['posted', 'assigned', 'submitted', 'verified', 'flagged_for_dispute', 'completed', 'complaint_filed', 'disputed'],
+            enum: ['posted', 'assigned', 'submitted', 'verified', 'flagged_for_dispute', 'completed', 'complaint_filed', 'disputed', 'pending_release_of_funds', 'buyer_disputed'],
             example: 'posted',
-            description: 'State machine: posted→assigned→verified|flagged_for_dispute→completed(auto 24h)|complaint_filed|disputed',
+            description: 'State machine: posted→assigned→submitted→verified|flagged_for_dispute→completed|pending_release_of_funds|buyer_disputed. Worker can request release if flagged_for_dispute.',
           },
           task_location: { type: 'string', example: 'Ikeja, Lagos' },
           location_latitude: { type: 'number', example: 6.6018 },
           location_longitude: { type: 'number', example: 3.3515 },
           due_date: { type: 'string', format: 'date-time' },
-          deliverable_spec: { type: 'object', nullable: true },
+          deliverable_spec: {
+            type: 'object',
+            nullable: true,
+            properties: {
+              photos_required: { type: 'boolean', example: true },
+              minimum_photos: { type: 'integer', example: 3 },
+              reference_image_urls: {
+                type: 'array',
+                items: { type: 'string', format: 'uri' },
+                example: ['http://localhost:3001/uploads/before-1.jpg']
+              },
+              notes: { type: 'string', example: 'Upload before photos of the workspace to compare with after completion.' }
+            }
+          },
           assigned_worker_id: { type: 'integer', nullable: true, example: 3 },
           assigned_at: { type: 'string', format: 'date-time', nullable: true },
           proof_submission: { type: 'object', nullable: true },
@@ -232,7 +245,7 @@ const openapiSpec = {
       CreateTaskRequest: {
         required: true,
         content: {
-          'application/json': {
+          'multipart/form-data': {
             schema: {
               type: 'object',
               required: ['title', 'description', 'amount_naira', 'task_location', 'due_date', 'deliverable_spec'],
@@ -247,7 +260,16 @@ const openapiSpec = {
                 location_latitude: { type: 'number', example: 6.6018 },
                 location_longitude: { type: 'number', example: 3.3515 },
                 due_date: { type: 'string', format: 'date-time' },
-                deliverable_spec: { type: 'object', example: { photos_required: true, minimum_photos: 3 } },
+                deliverable_spec: {
+                  type: 'string',
+                  example: '{"photos_required":true,"minimum_photos":3,"notes":"Upload before photos of the workspace."}',
+                  description: 'JSON string describing the deliverable spec and any reference image URLs.'
+                },
+                deliverable_images: {
+                  type: 'array',
+                  items: { type: 'string', format: 'binary' },
+                  description: 'Optional reference images for the deliverable specification.'
+                },
               },
             },
           },
@@ -440,13 +462,18 @@ const openapiSpec = {
         },
       },
     },
+
+    // ────────────────────────────────────────────────────────────────────────
+    // PUBLIC TASKS ENDPOINTS
+    // ────────────────────────────────────────────────────────────────────────
+
     '/api/v1/tasks': {
       get: {
         tags: ['Tasks'],
-        summary: 'List tasks',
+        summary: 'List all tasks (public read)',
         parameters: [
-          { name: 'status', in: 'query', schema: { type: 'string' }, required: false },
-          { name: 'location', in: 'query', schema: { type: 'string' }, required: false },
+          { name: 'status', in: 'query', schema: { type: 'string' }, required: false, description: 'Filter by status (posted, assigned, verified, etc.)' },
+          { name: 'location', in: 'query', schema: { type: 'string' }, required: false, description: 'Filter by location (case-insensitive substring match)' },
         ],
         responses: {
           200: {
@@ -457,50 +484,56 @@ const openapiSpec = {
               },
             },
           },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
       post: {
         tags: ['Tasks'],
-        summary: 'Create a task',
+        summary: 'Create a task (public, generates AI worker matches)',
         requestBody: { $ref: '#/components/requestBodies/CreateTaskRequest' },
         responses: {
           201: {
-            description: 'Task created successfully',
+            description: 'Task created successfully with AI worker matches',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
                   properties: {
                     task: { $ref: '#/components/schemas/Task' },
-                    matches: { type: 'array', items: { $ref: '#/components/schemas/WorkerMatch' } },
+                    matches: { type: 'array', items: { $ref: '#/components/schemas/WorkerMatch' }, description: 'AI-ranked worker matches' },
                   },
                 },
               },
             },
           },
+          400: { description: 'Missing required fields', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
     },
+
     '/api/v1/tasks/{id}': {
       get: {
         tags: ['Tasks'],
-        summary: 'Get a task by ID',
+        summary: 'Get a task by ID (public read)',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         responses: {
           200: { description: 'Task found', content: { 'application/json': { schema: { $ref: '#/components/schemas/Task' } } } },
           404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
     },
+
     '/api/v1/tasks/{id}/assign': {
       post: {
         tags: ['Tasks'],
-        summary: 'Assign a worker to a task',
+        summary: 'Assign a worker to a task (creates Squad escrow)',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         requestBody: { $ref: '#/components/requestBodies/AssignWorkerRequest' },
         responses: {
           200: {
-            description: 'Task assigned',
+            description: 'Worker assigned, Squad escrow VA created',
             content: {
               'application/json': {
                 schema: {
@@ -513,14 +546,18 @@ const openapiSpec = {
               },
             },
           },
+          400: { description: 'Worker ID is required or invalid', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Task or worker not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
     },
+
     '/api/v1/tasks/{id}/submit-proof': {
       post: {
         tags: ['Tasks'],
-        summary: 'Submit completion proof (triggers AI verification)',
-        description: 'Worker submits proof. The deterministic verification engine checks for file presence and GPS proximity, then the AI Decision Synthesizer interprets results. If verified, a 24-hour complaint window opens before payment auto-releases.',
+        summary: 'Submit task completion proof (triggers AI verification)',
+        description: 'Worker submits proof files and optional text. Deterministic checks verify file presence and GPS proximity, then AI Decision Synthesizer evaluates against deliverable_spec. If verified, a 24-hour complaint window opens before auto-payment release.',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         requestBody: { $ref: '#/components/requestBodies/SubmitProofRequest' },
         responses: {
@@ -532,100 +569,112 @@ const openapiSpec = {
               },
             },
           },
+          400: { description: 'Missing proof_submission field or invalid input', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
-          400: { description: 'Missing proof_submission field', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
     },
-    '/api/v1/tasks/{id}/complaint': {
-      post: {
-        tags: ['Tasks'],
-        summary: 'File a complaint (within 24-hour verified window)',
-        description: 'Buyer files a complaint after AI has verified the task. Only valid when task status is `verified`. Moves task to `complaint_filed` for human intervention.',
-        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
-        requestBody: { $ref: '#/components/requestBodies/ComplaintRequest' },
-        responses: {
-          200: {
-            description: 'Complaint registered',
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  properties: {
-                    message: { type: 'string', example: 'Complaint registered for human intervention' },
-                    task: { $ref: '#/components/schemas/Task' },
-                  },
-                },
-              },
-            },
-          },
-          400: { description: 'Task not in verified state', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
-          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
-        },
-      },
-    },
-    '/api/v1/tasks/{id}/dispute': {
-      post: {
-        tags: ['Tasks'],
-        summary: 'Manually dispute an AI-flagged task',
-        description: 'Worker manually disputes a task that was flagged by the AI as low-confidence. Only valid when task status is `flagged_for_dispute`. Moves task to `disputed`.',
-        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
-        requestBody: { $ref: '#/components/requestBodies/DisputeRequest' },
-        responses: {
-          200: {
-            description: 'Dispute filed',
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  properties: {
-                    message: { type: 'string', example: 'Manual dispute filed' },
-                    task: { $ref: '#/components/schemas/Task' },
-                  },
-                },
-              },
-            },
-          },
-          400: { description: 'Task not in flagged_for_dispute state', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
-          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
-        },
-      },
-    },
+
     '/api/v1/tasks/{id}/status': {
       get: {
         tags: ['Tasks'],
-        summary: 'Get task status summary',
+        summary: 'Get task status and timeline',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         responses: {
           200: {
-            description: 'Task status returned',
+            description: 'Task status and timeline',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
                   properties: {
                     id: { type: 'integer' },
-                    status: { type: 'string' },
+                    status: { type: 'string', enum: ['posted', 'assigned', 'submitted', 'verified', 'flagged_for_dispute', 'completed', 'complaint_filed', 'disputed'] },
                     assigned_worker_id: { type: 'integer', nullable: true },
                     submitted_at: { type: 'string', format: 'date-time', nullable: true },
                     verified_at: { type: 'string', format: 'date-time', nullable: true },
+                    completed_at: { type: 'string', format: 'date-time', nullable: true },
                   },
                 },
               },
             },
           },
+          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
     },
+
+    '/api/v1/tasks/{id}/complaint': {
+      post: {
+        tags: ['Tasks'],
+        summary: 'File a complaint on a verified task',
+        description: 'Legacy public complaint endpoint for tasks that are in the verified state and still inside the 24-hour dispute window.',
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { $ref: '#/components/requestBodies/ComplaintRequest' },
+        responses: {
+          200: {
+            description: 'Complaint registered for human intervention',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    message: { type: 'string' },
+                    task: { $ref: '#/components/schemas/Task' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Task must be verified or complaint window expired', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+
+    '/api/v1/tasks/{id}/dispute': {
+      post: {
+        tags: ['Tasks'],
+        summary: 'File a manual dispute for an AI-flagged task',
+        description: 'Legacy public dispute endpoint for tasks that were flagged_for_dispute by the AI. The request body may include a message for audit context.',
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { $ref: '#/components/requestBodies/DisputeRequest' },
+        responses: {
+          200: {
+            description: 'Manual dispute filed',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    message: { type: 'string' },
+                    task: { $ref: '#/components/schemas/Task' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Task must be flagged_for_dispute', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+
+    // ────────────────────────────────────────────────────────────────────────
+    // WORKERS ENDPOINTS (Public Read)
+    // ────────────────────────────────────────────────────────────────────────
+
     '/api/v1/workers': {
       get: {
         tags: ['Workers'],
-        summary: 'List workers',
+        summary: 'List workers (public read)',
         parameters: [
-          { name: 'location', in: 'query', schema: { type: 'string' }, required: false },
-          { name: 'skill', in: 'query', schema: { type: 'string' }, required: false },
-          { name: 'minRating', in: 'query', schema: { type: 'number' }, required: false },
+          { name: 'location', in: 'query', schema: { type: 'string' }, required: false, description: 'Filter by location (case-insensitive)' },
+          { name: 'skill', in: 'query', schema: { type: 'string' }, required: false, description: 'Filter by skill (exact match in array)' },
+          { name: 'minRating', in: 'query', schema: { type: 'number' }, required: false, description: 'Filter by minimum average rating' },
         ],
         responses: {
           200: {
@@ -636,11 +685,12 @@ const openapiSpec = {
               },
             },
           },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
       post: {
         tags: ['Workers'],
-        summary: 'Create a worker profile',
+        summary: 'Create a worker profile (public)',
         requestBody: { $ref: '#/components/requestBodies/CreateWorkerRequest' },
         responses: {
           201: {
@@ -651,22 +701,26 @@ const openapiSpec = {
               },
             },
           },
+          400: { description: 'Missing required fields', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
     },
+
     '/api/v1/workers/{id}': {
       get: {
         tags: ['Workers'],
-        summary: 'Get a worker by ID',
+        summary: 'Get a worker by ID (public read)',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         responses: {
           200: { description: 'Worker found', content: { 'application/json': { schema: { $ref: '#/components/schemas/Worker' } } } },
           404: { description: 'Worker not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
       put: {
         tags: ['Workers'],
-        summary: 'Update a worker profile',
+        summary: 'Update a worker profile (public)',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         requestBody: { $ref: '#/components/requestBodies/UpdateWorkerRequest' },
         responses: {
@@ -678,13 +732,17 @@ const openapiSpec = {
               },
             },
           },
+          400: { description: 'No valid fields to update', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Worker not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
     },
+
     '/api/v1/workers/{id}/stats': {
       get: {
         tags: ['Workers'],
-        summary: 'Get worker performance stats',
+        summary: 'Get worker performance stats (public read)',
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         responses: {
           200: {
@@ -734,6 +792,185 @@ const openapiSpec = {
         },
       },
     },
+
+    // ────────────────────────────────────────────────────────────────────────
+    // WALLET ENDPOINTS (Authenticated)
+    // ────────────────────────────────────────────────────────────────────────
+
+    '/api/v1/wallet': {
+      get: {
+        tags: ['Wallet'],
+        summary: 'Get wallet balance and summary (for buyer or worker)',
+        security: [{ BearerAuth: [] }],
+        responses: {
+          200: {
+            description: 'Wallet details',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'integer' },
+                    user_id: { type: 'integer' },
+                    wallet_type: { type: 'string', enum: ['buyer', 'worker'] },
+                    available_balance: { type: 'number' },
+                    total_earnings: { type: 'number', nullable: true },
+                    squad_va_number: { type: 'string', nullable: true },
+                    squad_bank_code: { type: 'string', nullable: true },
+                  },
+                },
+              },
+            },
+          },
+          401: { description: 'Unauthorized', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+
+    '/api/v1/wallet/transactions': {
+      get: {
+        tags: ['Wallet'],
+        summary: 'Get wallet transaction history',
+        security: [{ BearerAuth: [] }],
+        responses: {
+          200: {
+            description: 'Transaction history',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'integer' },
+                      wallet_id: { type: 'integer' },
+                      transaction_type: { type: 'string', example: 'earning' },
+                      amount: { type: 'number' },
+                      description: { type: 'string' },
+                      created_at: { type: 'string', format: 'date-time' },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          401: { description: 'Unauthorized' },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+
+    '/api/v1/wallet/virtual-account': {
+      post: {
+        tags: ['Wallet'],
+        summary: 'Assign or generate a virtual account for wallet',
+        security: [{ BearerAuth: [] }],
+        responses: {
+          200: {
+            description: 'Virtual account assigned',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: true },
+                    virtualAccount: { type: 'string', example: '1234567890' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Wallet already has a virtual account', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          401: { description: 'Unauthorized' },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+
+    '/api/v1/wallet/withdraw': {
+      post: {
+        tags: ['Wallet'],
+        summary: 'Request a withdrawal to bank account',
+        security: [{ BearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['amount', 'bankCode', 'bankAccountNumber', 'bankName'],
+                properties: {
+                  amount: { type: 'number', example: 50000, description: 'Amount in Naira' },
+                  bankCode: { type: 'string', example: '058', description: 'Bank code' },
+                  bankAccountNumber: { type: 'string', example: '1234567890' },
+                  bankName: { type: 'string', example: 'Guaranty Trust Bank' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: {
+            description: 'Withdrawal processing',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean', example: true },
+                    wallet: { type: 'object' },
+                    message: { type: 'string', example: 'Withdrawal processing' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Invalid withdrawal request', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          401: { description: 'Unauthorized' },
+        },
+      },
+    },
+
+    // ────────────────────────────────────────────────────────────────────────
+    // DEBUG ENDPOINTS
+    // ────────────────────────────────────────────────────────────────────────
+
+    '/api/v1/debug/ai-logs': {
+      get: {
+        tags: ['Admin'],
+        summary: 'Get recent AI decision synthesis logs (debug endpoint)',
+        responses: {
+          200: {
+            description: 'Recent AI logs (last 20)',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'integer' },
+                      task_id: { type: 'integer' },
+                      decision: { type: 'string' },
+                      confidence: { type: 'number' },
+                      details: { type: 'object' },
+                      created_at: { type: 'string', format: 'date-time' },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+
+    // ────────────────────────────────────────────────────────────────────────
+    // WEBHOOKS ENDPOINTS
+    // ────────────────────────────────────────────────────────────────────────
+
     '/api/v1/webhooks/squad': {
       post: {
         tags: ['Webhooks'],
@@ -929,7 +1166,7 @@ const openapiSpec = {
         responses: { 200: { description: 'Task detail' }, 404: { description: 'Not found or not yours' } } },
     },
     '/api/v1/buyer/tasks/{id}/assign': {
-      post: { tags: ['Buyer'], summary: 'Assign worker → creates Squad escrow VA', security: [{ BearerAuth: [] }],
+      post: { tags: ['Buyer'], summary: 'Assign worker → locks funds in wallet → creates Squad escrow VA', security: [{ BearerAuth: [] }],
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['worker_id'], properties: { worker_id: { type: 'integer' } } } } } },
         responses: { 200: { description: 'Worker assigned, escrow VA created' } } },
@@ -943,7 +1180,7 @@ const openapiSpec = {
         responses: { 200: { description: 'Dispute filed' }, 400: { description: 'Window expired or invalid state' } } },
     },
     '/api/v1/buyer/tasks/{id}/release-funds': {
-      post: { tags: ['Buyer'], summary: 'Manually release funds early (bypass 24h window)', security: [{ BearerAuth: [] }],
+      post: { tags: ['Buyer'], summary: 'Manually release funds early (bypass 24h window) → transfers from wallet to worker', security: [{ BearerAuth: [] }],
         parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
         responses: { 200: { description: 'Funds released' } } },
     },
@@ -958,6 +1195,54 @@ const openapiSpec = {
     },
 
     // ── Worker Profile (authenticated worker self-service) ───────────────────
+    '/api/v1/worker-profile/create': {
+      post: {
+        tags: ['Worker Profile'],
+        summary: 'Create a new worker profile and auto-link to authenticated worker account',
+        security: [{ BearerAuth: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['name', 'primary_location'],
+                properties: {
+                  name: { type: 'string', example: 'Emeka Nwosu' },
+                  phone: { type: 'string', example: '+2348012345678' },
+                  skills: { type: 'array', items: { type: 'string' }, example: ['cleaning', 'delivery'] },
+                  bio: { type: 'string', example: 'Reliable and punctual worker.' },
+                  primary_location: { type: 'string', example: 'Lagos' },
+                  latitude: { type: 'number', example: 6.5244 },
+                  longitude: { type: 'number', example: 3.3792 },
+                  avatar_url: { type: 'string', example: 'https://example.com/avatar.jpg' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          201: {
+            description: 'Worker profile created and linked to account',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    message: { type: 'string', example: 'Worker profile created and linked to your account' },
+                    worker: { $ref: '#/components/schemas/Worker' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Missing required fields', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          403: { description: 'Only workers can create a profile', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+
     '/api/v1/worker-profile/me': {
       get: { tags: ['Worker Profile'], summary: 'My full worker profile + tier + credit score', security: [{ BearerAuth: [] }],
         responses: { 200: { description: 'Worker profile with credit_score, credit_band, tier' } } },
@@ -1018,6 +1303,81 @@ const openapiSpec = {
           201: { description: 'Insurance application submitted' },
           403: { description: 'Not verified or credit score too low' },
           409: { description: 'Active policy of this type already exists' },
+        },
+      },
+    },
+
+    '/api/v1/worker-profile/me/tasks': {
+      get: {
+        tags: ['Worker Profile'],
+        summary: 'Get all tasks assigned to authenticated worker',
+        security: [{ BearerAuth: [] }],
+        responses: {
+          200: {
+            description: 'List of assigned tasks with escrow status',
+            content: { 'application/json': { schema: { type: 'array', items: { $ref: '#/components/schemas/Task' } } } },
+          },
+          500: { description: 'Server error' },
+        },
+      },
+    },
+
+    '/api/v1/worker-profile/me/tasks/{id}': {
+      get: {
+        tags: ['Worker Profile'],
+        summary: 'Get a specific task assigned to authenticated worker',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: {
+          200: {
+            description: 'Task details with escrow status',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Task' } } },
+          },
+          404: { description: 'Task not found or not assigned to you' },
+          500: { description: 'Server error' },
+        },
+      },
+    },
+
+    '/api/v1/worker-profile/me/tasks/{id}/request-release': {
+      post: {
+        tags: ['Worker Profile'],
+        summary: 'Request fund release if AI flagged work unfairly',
+        description: 'Worker can request that an admin review their work and release funds if they believe the AI rejected them unfairly.',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['reason'],
+                properties: {
+                  reason: { type: 'string', example: 'The AI incorrectly rejected my work. All deliverables were met.' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: {
+            description: 'Fund release request submitted for admin review. Task status set to pending_release_of_funds.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    message: { type: 'string' },
+                    status: { type: 'string', example: 'pending_release_of_funds' },
+                    next_steps: { type: 'array', items: { type: 'string' } },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Missing reason or invalid task state' },
+          404: { description: 'Task not found or not assigned to you' },
         },
       },
     },
@@ -1117,6 +1477,78 @@ const openapiSpec = {
         }}}}},
         responses: { 200: { description: 'Dispute resolved' } } },
     },
+
+    '/api/v1/admin/tasks/{id}/resolve-worker-release-request': {
+      patch: {
+        tags: ['Admin'],
+        summary: 'Approve or reject worker fund release request (when they feel AI was unfair)',
+        description: 'Admin reviews a worker\'s request to release funds and decides whether to approve (mark complete + transfer funds) or reject (revert to verification state).',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['decision'],
+                properties: {
+                  decision: { type: 'string', enum: ['approve', 'reject'], example: 'approve' },
+                  reason: { type: 'string', example: 'Worker\'s submission clearly meets deliverable requirements' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: {
+            description: 'Decision processed. On approve: funds transferred from buyer to worker. On reject: task reverted to AI verification state.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    message: { type: 'string' },
+                    task_id: { type: 'integer' },
+                    new_status: { type: 'string' },
+                    amount_released: { type: 'number', nullable: true },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Invalid decision or wallet transfer failed' },
+          404: { description: 'Task not found' },
+        },
+      },
+    },
+
+    '/api/v1/admin/pending-release-requests': {
+      get: {
+        tags: ['Admin'],
+        summary: 'List all worker fund release requests pending admin review',
+        description: 'Returns all tasks in pending_release_of_funds state with worker info and request reasons.',
+        security: [{ BearerAuth: [] }],
+        responses: {
+          200: {
+            description: 'List of pending release requests',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    pending_requests: { type: 'array', items: { type: 'object' } },
+                    count: { type: 'integer' },
+                  },
+                },
+              },
+            },
+          },
+          500: { description: 'Server error' },
+        },
+      },
+    },
+
     '/api/v1/admin/workers': {
       get: { tags: ['Admin'], summary: 'All workers with trust scores and assigned_tasks count', security: [{ BearerAuth: [] }],
         parameters: [
@@ -1229,4 +1661,4 @@ const openapiSpec = {
   },
 };
 
-export default openapiSpec;
+export default openapiSpec;

@@ -21,7 +21,7 @@ async function runMigrations(): Promise<void> {
       )
     `);
 
-    // ─── Add dispute-window columns to tasks ─────────────────────────────────
+    // ─── Add dispute-window columns and new multi-worker columns to tasks ─────────────────────────────────
     // verified_at already exists; we add the 24-hour window expiry
     await query(`
       ALTER TABLE tasks
@@ -32,7 +32,11 @@ async function runMigrations(): Promise<void> {
         ADD COLUMN IF NOT EXISTS dispute_reason TEXT,
         ADD COLUMN IF NOT EXISTS admin_resolution TEXT,
         ADD COLUMN IF NOT EXISTS admin_resolved_at TIMESTAMP,
-        ADD COLUMN IF NOT EXISTS admin_resolved_by INTEGER REFERENCES users(id)
+        ADD COLUMN IF NOT EXISTS admin_resolved_by INTEGER REFERENCES users(id),
+        ADD COLUMN IF NOT EXISTS shortlisted_workers JSONB,
+        ADD COLUMN IF NOT EXISTS selected_worker_id INTEGER REFERENCES workers(id),
+        ADD COLUMN IF NOT EXISTS buyer_confirmed BOOLEAN DEFAULT false,
+        ADD COLUMN IF NOT EXISTS worker_confirmed BOOLEAN DEFAULT false
     `);
 
     // ─── Dispute logs table ───────────────────────────────────────────────────
@@ -63,6 +67,20 @@ async function runMigrations(): Promise<void> {
         entity_id INTEGER,
         metadata JSONB DEFAULT '{}'::jsonb,
         created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    // ─── Task applications ───────────────────────────────────────────────────
+    await query(`
+      CREATE TABLE IF NOT EXISTS task_applications (
+        id SERIAL PRIMARY KEY,
+        task_id INTEGER NOT NULL REFERENCES tasks(id),
+        worker_id INTEGER NOT NULL REFERENCES workers(id),
+        proposed_price DECIMAL(15, 2) NOT NULL,
+        message TEXT,
+        status VARCHAR(50) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(task_id, worker_id)
       )
     `);
 

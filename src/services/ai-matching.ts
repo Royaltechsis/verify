@@ -31,7 +31,11 @@ interface MatchResult {
   worker_id: number;
   name: string;
   match_score: number;
-  reasons: string[];
+  rank?: number;
+  recommendation_reason?: string;
+  strengths?: string[];
+  risks?: string[];
+  confidence?: number;
   distance_km: number;
 }
 
@@ -121,7 +125,7 @@ async function getWorkerMatches(task: Task, limit: number = 5): Promise<MatchRes
     const finalizedDecision = await synthesizeDecision(synthesisInput);
 
     // Reconstruct MatchResult array, ensuring the chosen candidate is first and reasons are returned
-    const finalRanked = finalizedDecision.ranking.map(r => {
+    const finalRanked = finalizedDecision.recommended_workers.map(r => {
       const ec = engineCandidates.find(c => c.candidateData.worker_id.toString() === r.worker_id);
       if (!ec) return null;
       return {
@@ -129,9 +133,11 @@ async function getWorkerMatches(task: Task, limit: number = 5): Promise<MatchRes
         name: ec.worker.name,
         match_score: typeof r.score === 'number' ? r.score : parseFloat(r.score as string) || ec.candidateData.match_score,
         distance_km: Math.round(ec.distance * 100) / 100,
-        reasons: r.worker_id === finalizedDecision.selected_worker_id 
-          ? [finalizedDecision.reasoning, ...finalizedDecision.risk_analysis] 
-          : ['Ranked lower due to AI tradeoffs analysis']
+        rank: r.rank,
+        recommendation_reason: r.recommendation_reason,
+        strengths: r.strengths,
+        risks: r.risks,
+        confidence: r.confidence
       };
     }).filter(Boolean) as MatchResult[];
 
@@ -140,7 +146,8 @@ async function getWorkerMatches(task: Task, limit: number = 5): Promise<MatchRes
       name: ec.worker.name,
       match_score: ec.candidateData.match_score,
       distance_km: Math.round(ec.distance * 100) / 100,
-      reasons: ["Fallback candidate from deterministic engine."]
+      recommendation_reason: "Fallback candidate from deterministic engine.",
+      risks: ["AI synthesis unavailable"]
     }));
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);

@@ -71,6 +71,78 @@ async function resolveWorker(req: Request, res: Response): Promise<any | null> {
   return result.rows[0];
 }
 
+// ─── POST /api/v1/worker-profile/create ──────────────────────────────────────
+// Create a new worker profile and auto-link it to the authenticated user
+router.post('/create', async (req: Request, res: Response) => {
+  try {
+    if (req.user!.role !== 'worker') {
+      return res.status(403).json({ error: 'Only workers can create a worker profile' });
+    }
+
+    if (req.user!.worker_id) {
+      return res.status(400).json({ error: 'You already have a linked worker profile' });
+    }
+
+    const {
+      name,
+      phone,
+      skills,
+      bio,
+      primary_location,
+      latitude,
+      longitude,
+      avatar_url
+    } = req.body;
+
+    if (!name || !primary_location) {
+      return res.status(400).json({ error: 'name and primary_location are required' });
+    }
+
+    const defaultEconomicProfile = {
+      identity_verified: false,
+      verification_sources: phone ? ['phone'] : [],
+      behavioral_score: 50,
+      reliability_score: 50,
+      earning_pattern: [],
+      risk_level: 'medium'
+    };
+    
+    const defaultFinancialProfile = {
+      credit_score: 300,
+      loan_eligibility: false,
+      recommended_loan: 0,
+      insurance_risk_level: 'medium'
+    };
+
+    // Create worker profile
+    const workerResult = await query(
+      `INSERT INTO workers (name, email, phone, skills, bio, primary_location, latitude, longitude, avatar_url, economic_profile, financial_profile)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING *`,
+      [name, req.user!.email, phone || null, skills || [], bio || null, primary_location, latitude || null, longitude || null, avatar_url || null, JSON.stringify(defaultEconomicProfile), JSON.stringify(defaultFinancialProfile)]
+    );
+
+    const worker = workerResult.rows[0];
+
+    // Auto-link the worker profile to the user account
+    await query(
+      `UPDATE users SET worker_id = $1, updated_at = NOW() WHERE id = $2`,
+      [worker.id, req.user!.id]
+    );
+
+    await auditLog(req.user!.id, 'worker', 'create_worker_profile', 'workers', worker.id, { name });
+
+    return res.status(201).json({
+      message: 'Worker profile created and linked to your account',
+      worker
+    });
+  } catch (error: any) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('[Worker Profile] Create error:', errorMessage);
+    return res.status(500).json({ error: 'Failed to create worker profile' });
+  }
+});
+
 // ─── GET /api/v1/worker-profile/me ───────────────────────────────────────────
 // My full profile + tier + credit score
 router.get('/me', async (req: Request, res: Response) => {
@@ -377,6 +449,130 @@ router.post('/me/insurance', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[WorkerProfile] Insurance apply error:', err.message);
     return res.status(500).json({ error: 'Failed to submit insurance application' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TASKS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ─── GET /api/v1/worker-profile/me/tasks ─────────────────────────────────────
+// Get all tasks assigned to the authenticated worker
+router.get('/me/tasks', async (req: Request, res: Response) => {
+  try {
+    const worker = await resolveWorker(req, res);
+    if (!worker) return;
+
+    const result = await query(
+      `SELECT t.*, e.status AS escrow_status, e.squad_va_number, e.funded_at, e.released_to_worker_at
+       FROM tasks t
+       LEFT JOIN escrow_accounts e ON e.task_id = t.id
+       WHERE t.assigned_worker_id = $1
+       ORDER BY t.created_at DESC`,
+      [worker.id]
+    );
+    return res.json(result.rows);
+  } catch (err: any) {
+    console.error('[WorkerProfile] Error fetching worker tasks:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch worker tasks' });
+  }
+});
+
+// ─── GET /api/v1/worker-profile/me/tasks/:id ────────────────────────────────
+// Get a specific task assigned to the worker
+router.get('/me/tasks/:id', async (req: Request, res: Response) => {
+  try {
+    const worker = await resolveWorker(req, res);
+    if (!worker) return;
+
+    const result = await query(
+      `SELECT t.*, e.status AS escrow_status, e.squad_va_number, e.funded_at, e.released_to_worker_at
+       FROM tasks t
+       LEFT JOIN escrow_accounts e ON e.task_id = t.id
+       WHERE t.id = $1 AND t.assigned_worker_id = $2`,
+      [req.params.id, worker.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found or not assigned to you' });
+    }
+
+    return res.json(result.rows[0]);
+  } catch (err: any) {
+    console.error('[WorkerProfile] Error fetching task:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch task' });
+  }
+});
+
+// ─── POST /api/v1/worker-profile/me/tasks/:id/request-release ────────────────
+// Worker requests fund release when they feel AI has unfairly rejected work
+router.post('/me/tasks/:id/request-release', async (req: Request, res: Response) => {
+  try {
+    const worker = await resolveWorker(req, res);
+    if (!worker) return;
+
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    if (!reason) {
+      return res.status(400).json({ error: 'Please provide a reason for requesting fund release' });
+    }
+
+    // Get the task
+    const taskResult = await query(
+      `SELECT * FROM tasks WHERE id = $1 AND assigned_worker_id = $2`,
+      [id, worker.id]
+    );
+
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found or not assigned to you' });
+    }
+
+    const task = taskResult.rows[0];
+
+    // Only allow release requests when AI has flagged the work
+    const validStatuses = ['flagged_for_dispute', 'verified'];
+    if (!validStatuses.includes(task.status)) {
+      return res.status(400).json({
+        error: `Cannot request release for task in '${task.status}' state. Task must be flagged or verified by AI.`,
+        current_status: task.status,
+        valid_statuses: validStatuses,
+      });
+    }
+
+    // Update task status to pending_release_of_funds
+    const updateResult = await query(
+      `UPDATE tasks 
+       SET status = 'pending_release_of_funds', updated_at = NOW() 
+       WHERE id = $1 
+       RETURNING *`,
+      [id]
+    );
+
+    // Create a log entry (optional but recommended)
+    await query(
+      `INSERT INTO dispute_logs (task_id, filed_by, reason, status)
+       VALUES ($1, $2, $3, 'open')`,
+      [id, req.user!.id, `Worker request for fund release - AI rejection concern: ${reason}`]
+    );
+
+    await auditLog(req.user!.id, 'worker', 'request_fund_release', 'tasks', parseInt(id), {
+      reason,
+    });
+
+    return res.json({
+      message: 'Fund release request submitted. An admin will review your case within 48 hours.',
+      task: updateResult.rows[0],
+      status: 'pending_release_of_funds',
+      next_steps: [
+        'An admin will review your AI verification results',
+        'If the review supports your case, funds will be released',
+        'You will receive a notification of the decision'
+      ]
+    });
+  } catch (err: any) {
+    console.error('[WorkerProfile] Error requesting fund release:', err.message);
+    return res.status(500).json({ error: 'Failed to request fund release' });
   }
 });
 

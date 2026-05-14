@@ -5,6 +5,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { authenticate, requireRole, auditLog } from '../middleware/auth';
 import { getWorkerMatches } from '../services/ai-matching';
 import { createSquadEscrow } from '../services/squad-service';
+import { WalletService } from '../services/wallet-service';
+import { releaseEscrowToWorker } from '../services/squad-service';
 import type { Task } from '../types';
 
 const router = Router();
@@ -133,8 +135,21 @@ router.post('/tasks/:id/assign', async (req: Request, res: Response) => {
     }
 
     const task = taskResult.rows[0];
+    
+    try {
+      // 1. Lock funds in buyer's wallet for this task
+      await WalletService.lockFundsForTask(req.user!.id, 'buyer', task.amount_naira, task.id);
+    } catch (walletError: any) {
+      return res.status(400).json({
+        error: 'Cannot assign task - insufficient wallet balance',
+        details: walletError.message,
+      });
+    }
+
+    // 2. Create Squad escrow account
     const escrow = await createSquadEscrow(task.id, task.amount_naira);
 
+    // 3. Update task with assignment
     const result = await query(
       `UPDATE tasks
          SET assigned_worker_id = $1, assigned_at = NOW(), status = 'assigned',
@@ -145,9 +160,14 @@ router.post('/tasks/:id/assign', async (req: Request, res: Response) => {
 
     await auditLog(req.user!.id, req.user!.role, 'assign_worker', 'tasks', parseInt(id), {
       worker_id,
+      amount_locked: task.amount_naira,
     });
 
-    return res.json({ task: result.rows[0], escrow });
+    return res.json({ 
+      task: result.rows[0], 
+      escrow,
+      message: `Funds locked in escrow. Worker has been assigned.`
+    });
   } catch (error: any) {
     console.error('[Buyer] Error assigning worker:', error.message);
     return res.status(500).json({ error: 'Failed to assign worker' });
@@ -227,7 +247,10 @@ router.post('/tasks/:id/release-funds', async (req: Request, res: Response) => {
     const { id } = req.params;
 
     const taskResult = await query(
-      'SELECT * FROM tasks WHERE id = $1 AND buyer_user_id = $2',
+      `SELECT t.*, e.id AS escrow_id, e.status AS escrow_status, e.amount_naira AS escrow_amount
+       FROM tasks t
+       LEFT JOIN escrow_accounts e ON e.task_id = t.id
+       WHERE t.id = $1 AND t.buyer_user_id = $2`,
       [id, req.user!.id]
     );
     if (taskResult.rows.length === 0) {
@@ -237,7 +260,7 @@ router.post('/tasks/:id/release-funds', async (req: Request, res: Response) => {
     const task = taskResult.rows[0];
 
     // Allow release if task is verified (during window) or pending_release
-    const releasableStatuses = ['verified', 'pending_release'];
+    const releasableStatuses = ['verified', 'pending_release', 'flagged_for_dispute'];
     if (!releasableStatuses.includes(task.status)) {
       return res.status(400).json({
         error: `Cannot release funds for task in '${task.status}' state.`,
@@ -245,20 +268,59 @@ router.post('/tasks/:id/release-funds', async (req: Request, res: Response) => {
       });
     }
 
-    // Mark task as completed immediately
-    await query(
-      `UPDATE tasks
-         SET status = 'completed', buyer_released_at = NOW(), completed_at = NOW()
-       WHERE id = $1`,
-      [id]
-    );
+    try {
+      // 1. Process wallet transfer: buyer wallet → worker wallet
+      if (task.assigned_worker_id && task.amount_naira) {
+        await WalletService.releaseEscrowToWorker(
+          req.user!.id,
+          task.assigned_worker_id,
+          task.amount_naira,
+          task.id
+        );
+      }
 
-    await auditLog(req.user!.id, req.user!.role, 'buyer_manual_release', 'tasks', parseInt(id), {});
+      // 2. Attempt Squad escrow release
+      if (task.escrow_id) {
+        try {
+          await releaseEscrowToWorker(task.escrow_id, task.assigned_worker_id);
+        } catch (squadError) {
+          console.warn(`[Buyer] Squad release failed for escrow ${task.escrow_id}, but local wallet updated:`, squadError);
+          // Continue - wallet already updated locally
+        }
+      }
 
-    return res.json({
-      message: 'Funds released to worker. Task marked as completed.',
-      released_at: new Date().toISOString(),
-    });
+      // 3. Mark task as completed immediately
+      await query(
+        `UPDATE tasks
+           SET status = 'completed', buyer_released_at = NOW(), completed_at = NOW()
+         WHERE id = $1`,
+        [id]
+      );
+
+      // 4. Update escrow account status to released
+      await query(
+        `UPDATE escrow_accounts 
+         SET status = 'released', released_to_worker_at = NOW()
+         WHERE task_id = $1`,
+        [id]
+      );
+
+      await auditLog(req.user!.id, req.user!.role, 'buyer_manual_release', 'tasks', parseInt(id), {
+        amount_released: task.amount_naira,
+      });
+
+      return res.json({
+        message: 'Funds released to worker. Task marked as completed.',
+        released_at: new Date().toISOString(),
+        amount_released: task.amount_naira,
+      });
+    } catch (processError: any) {
+      console.error('[Buyer] Error processing fund release:', processError.message);
+      return res.status(400).json({
+        error: 'Failed to process fund release',
+        details: processError.message,
+      });
+    }
   } catch (error: any) {
     console.error('[Buyer] Error releasing funds:', error.message);
     return res.status(500).json({ error: 'Failed to release funds' });
