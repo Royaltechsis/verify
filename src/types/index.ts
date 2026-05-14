@@ -42,6 +42,7 @@ export interface Task {
   due_date: string;
   deliverable_spec: any;
   ai_recommendations?: any;
+  buyer_user_id?: number;
   assigned_worker_id?: number;
   assigned_at?: string;
   proof_submission?: any;

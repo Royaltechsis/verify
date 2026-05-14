@@ -325,6 +325,29 @@ const openapiSpec = {
           },
         },
       },
+      UpdateTaskRequest: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              properties: {
+                title: { type: 'string', example: 'Updated office cleaning for 3 rooms' },
+                description: { type: 'string', example: 'Deep clean, sanitize, and polish the office space.' },
+                client_name: { type: 'string', example: 'TaskVerify Client' },
+                client_email: { type: 'string', format: 'email', example: 'client@example.com' },
+                required_skills: { type: 'array', items: { type: 'string' }, example: ['cleaning', 'sanitization'], description: 'Can be array or comma-separated string in client payload.' },
+                amount_naira: { type: 'number', example: 30000 },
+                task_location: { type: 'string', example: 'Ikeja, Lagos' },
+                location_latitude: { type: 'number', example: 6.6018 },
+                location_longitude: { type: 'number', example: 3.3515 },
+                due_date: { type: 'string', format: 'date-time', example: '2026-05-25T10:00:00Z' },
+                deliverable_spec: { type: 'object', example: { photos_required: true, minimum_photos: 4, notes: 'Capture before and after photos.' } },
+              },
+            },
+          },
+        },
+      },
       AssignWorkerRequest: {
         required: true,
         content: {
@@ -600,7 +623,8 @@ const openapiSpec = {
       },
       post: {
         tags: ['Tasks'],
-        summary: 'Create a task (Buyer/Admin)',
+        summary: 'Create a task and auto-generate AI worker recommendations',
+        description: 'Buyer/Admin creates a task. The API runs AI synthesis to rank top workers and persists results to task.ai_recommendations.',
         security: [{ BearerAuth: [] }],
         requestBody: { $ref: '#/components/requestBodies/CreateTaskRequest' },
         responses: {
@@ -618,7 +642,8 @@ const openapiSpec = {
               },
             },
           },
-          400: { description: 'Missing required fields', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          400: { description: 'Missing required fields or invalid deliverable_spec JSON', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          401: { description: 'Unauthorized', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },
@@ -635,6 +660,68 @@ const openapiSpec = {
           200: { description: 'Task found', content: { 'application/json': { schema: { $ref: '#/components/schemas/Task' } } } },
           401: { description: 'Unauthorized', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           404: { description: 'Task not found (or not visible to current user)', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+      patch: {
+        tags: ['Tasks'],
+        summary: 'Update a task (buyer owner/admin)',
+        description: 'Allows buyer (owner) or admin to update a task while still editable (posted/shortlisted/applications_open/selection_in_progress).',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { $ref: '#/components/requestBodies/UpdateTaskRequest' },
+        responses: {
+          200: { description: 'Task updated successfully', content: { 'application/json': { schema: { type: 'object', properties: { task: { $ref: '#/components/schemas/Task' }, message: { type: 'string' } } } } } },
+          400: { description: 'Invalid payload or task not editable in current status', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          401: { description: 'Unauthorized', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          403: { description: 'Not authorized for this task', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+      delete: {
+        tags: ['Tasks'],
+        summary: 'Delete a task (buyer owner/admin)',
+        description: 'Allows buyer (owner) or admin to delete a task while still editable (posted/shortlisted/applications_open/selection_in_progress).',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: {
+          200: { description: 'Task deleted successfully' },
+          400: { description: 'Task not deletable at current status', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          401: { description: 'Unauthorized', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          403: { description: 'Not authorized for this task', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+        },
+      },
+    },
+
+    '/api/v1/tasks/{id}/recommend-workers': {
+      post: {
+        tags: ['Tasks'],
+        summary: 'Refresh AI-recommended workers for a task',
+        description: 'Triggers AI synthesis to recompute worker matches for the task and persists them to task.ai_recommendations. Useful for buyer UI button action.',
+        security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: {
+          200: {
+            description: 'AI recommendations refreshed successfully',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    task: { $ref: '#/components/schemas/Task' },
+                    matches: { type: 'array', items: { $ref: '#/components/schemas/WorkerMatch' } },
+                    message: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          401: { description: 'Unauthorized', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          403: { description: 'Not authorized for this task', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
+          404: { description: 'Task not found', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
           500: { description: 'Server error', content: { 'application/json': { schema: { $ref: '#/components/schemas/ErrorResponse' } } } },
         },
       },

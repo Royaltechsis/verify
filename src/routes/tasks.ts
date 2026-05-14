@@ -12,6 +12,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { NotificationService } from '../services/notification-service';
 
 const router = Router();
+type TaskWithBuyer = Task & { buyer_user_id?: number };
 
 // Configure storage
 const storage = multer.diskStorage({
@@ -22,6 +23,40 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage: storage });
+
+const normalizeSkillsInput = (skillsInput: any): string[] => {
+  if (Array.isArray(skillsInput)) {
+    return skillsInput.map((s: any) => String(s).trim()).filter(Boolean);
+  }
+
+  if (typeof skillsInput === 'string') {
+    const trimmed = skillsInput.trim();
+    if (!trimmed) return [];
+
+    // Accept JSON string array from form-data or frontend serializers.
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return parsed.map((s: any) => String(s).trim()).filter(Boolean);
+        }
+      } catch {
+        // Fall back to comma-separated parsing below.
+      }
+    }
+
+    return trimmed.split(',').map((s: string) => s.trim()).filter(Boolean);
+  }
+
+  return [];
+};
+
+const normalizeDeliverableSpecInput = (deliverableSpecRaw: any): any => {
+  if (typeof deliverableSpecRaw === 'string') {
+    return JSON.parse(deliverableSpecRaw);
+  }
+  return deliverableSpecRaw;
+};
 
 const buildTaskAccessClause = (user: Request['user'], params: any[]): string => {
   if (!user) {
@@ -145,13 +180,15 @@ router.post('/', authenticate, requireRole('buyer', 'admin'), parseTaskCreationU
       location_latitude,
       location_longitude,
       due_date,
-      deliverable_spec: deliverableSpecRaw
+      deliverable_spec: deliverableSpecRaw,
+      deliverableSpec: deliverableSpecAlt
     } = req.body as any;
 
-    let deliverable_spec = deliverableSpecRaw;
-    if (typeof deliverableSpecRaw === 'string') {
+    const deliverableSpecValue = deliverableSpecRaw ?? deliverableSpecAlt;
+    let deliverable_spec = deliverableSpecValue;
+    if (typeof deliverableSpecValue === 'string') {
       try {
-        deliverable_spec = JSON.parse(deliverableSpecRaw);
+        deliverable_spec = normalizeDeliverableSpecInput(deliverableSpecValue);
       } catch {
         return res.status(400).json({ error: 'deliverable_spec must be valid JSON' });
       }
@@ -165,13 +202,8 @@ router.post('/', authenticate, requireRole('buyer', 'admin'), parseTaskCreationU
       return res.status(400).json({ error: 'deliverable_spec must be an object' });
     }
 
-    // Ensure required_skills is an array
-    let skillsArray = required_skills;
-    if (typeof required_skills === 'string') {
-      skillsArray = required_skills.split(',').map((s: string) => s.trim());
-    } else if (!Array.isArray(required_skills)) {
-      skillsArray = [];
-    }
+    // Accept array, comma-separated string, or JSON-string array.
+    const skillsArray = normalizeSkillsInput(required_skills);
 
     const uploadedFiles = req.files as Express.Multer.File[] | undefined;
     const deliverableImageUrls = uploadedFiles?.map(f => `http://localhost:${process.env.PORT || 3001}/uploads/${f.filename}`) || [];
@@ -222,6 +254,179 @@ router.post('/', authenticate, requireRole('buyer', 'admin'), parseTaskCreationU
     const errorMessage = error instanceof Error ? error.message : String(error);
     console.error('[Tasks] Error creating task:', errorMessage);
     return res.status(500).json({ error: 'Failed to create task' });
+  }
+});
+
+// Refresh AI recommendations for an existing task (buyer/admin)
+router.post('/:id/recommend-workers', authenticate, requireRole('buyer', 'admin'), async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+
+    const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    const task = taskResult.rows[0] as TaskWithBuyer;
+    if (req.user?.role !== 'admin' && task.buyer_user_id !== req.user?.id) {
+      return res.status(403).json({ error: 'Not authorized for this task' });
+    }
+
+    const matches = await getWorkerMatches(task, 5);
+
+    const updatedResult = await query(
+      'UPDATE tasks SET ai_recommendations = $1 WHERE id = $2 RETURNING *',
+      [JSON.stringify(matches), id]
+    );
+
+    return res.json({
+      task: updatedResult.rows[0],
+      matches,
+      message: 'AI recommendations refreshed successfully'
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('[Tasks] Error refreshing AI recommendations:', errorMessage);
+    return res.status(500).json({ error: 'Failed to refresh AI recommendations' });
+  }
+});
+
+// Update task (buyer owner or admin)
+router.patch('/:id', authenticate, requireRole('buyer', 'admin'), async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const {
+      title,
+      description,
+      client_name,
+      client_email,
+      required_skills,
+      amount_naira,
+      task_location,
+      location_latitude,
+      location_longitude,
+      due_date,
+      deliverable_spec,
+      deliverableSpec
+    } = req.body as any;
+
+    const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    const existingTask = taskResult.rows[0] as TaskWithBuyer;
+    if (req.user?.role !== 'admin' && existingTask.buyer_user_id !== req.user?.id) {
+      return res.status(403).json({ error: 'Not authorized for this task' });
+    }
+
+    if (!['posted', 'shortlisted', 'applications_open', 'selection_in_progress'].includes(existingTask.status)) {
+      return res.status(400).json({ error: 'Task cannot be updated at the current status' });
+    }
+
+    let parsedDeliverableSpec = deliverable_spec ?? deliverableSpec;
+    if (typeof parsedDeliverableSpec === 'string') {
+      try {
+        parsedDeliverableSpec = normalizeDeliverableSpecInput(parsedDeliverableSpec);
+      } catch {
+        return res.status(400).json({ error: 'deliverable_spec must be valid JSON' });
+      }
+    }
+
+    if (parsedDeliverableSpec != null && typeof parsedDeliverableSpec !== 'object') {
+      return res.status(400).json({ error: 'deliverable_spec must be an object' });
+    }
+
+    const mergedSkills = required_skills == null
+      ? existingTask.required_skills
+      : normalizeSkillsInput(required_skills);
+
+    const mergedTask = {
+      title: title ?? existingTask.title,
+      description: description ?? existingTask.description,
+      client_name: client_name ?? existingTask.client_name,
+      client_email: client_email ?? existingTask.client_email,
+      required_skills: mergedSkills,
+      amount_naira: amount_naira ?? existingTask.amount_naira,
+      task_location: task_location ?? existingTask.task_location,
+      location_latitude: location_latitude ?? existingTask.location_latitude,
+      location_longitude: location_longitude ?? existingTask.location_longitude,
+      due_date: due_date ?? existingTask.due_date,
+      deliverable_spec: parsedDeliverableSpec ?? existingTask.deliverable_spec,
+    };
+
+    const result = await query(
+      `UPDATE tasks
+       SET title = $1,
+           description = $2,
+           client_name = $3,
+           client_email = $4,
+           required_skills = $5,
+           amount_naira = $6,
+           task_location = $7,
+           location_latitude = $8,
+           location_longitude = $9,
+           due_date = $10,
+           deliverable_spec = $11,
+           updated_at = NOW()
+       WHERE id = $12
+       RETURNING *`,
+      [
+        mergedTask.title,
+        mergedTask.description,
+        mergedTask.client_name,
+        mergedTask.client_email,
+        mergedTask.required_skills,
+        mergedTask.amount_naira,
+        mergedTask.task_location,
+        mergedTask.location_latitude,
+        mergedTask.location_longitude,
+        mergedTask.due_date,
+        JSON.stringify(mergedTask.deliverable_spec),
+        id,
+      ]
+    );
+
+    return res.json({
+      task: result.rows[0],
+      message: 'Task updated successfully'
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('[Tasks] Error updating task:', errorMessage);
+    return res.status(500).json({ error: 'Failed to update task' });
+  }
+});
+
+// Delete task (buyer owner or admin)
+router.delete('/:id', authenticate, requireRole('buyer', 'admin'), async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+
+    const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    const task = taskResult.rows[0] as TaskWithBuyer;
+    if (req.user?.role !== 'admin' && task.buyer_user_id !== req.user?.id) {
+      return res.status(403).json({ error: 'Not authorized for this task' });
+    }
+
+    // Prevent deleting tasks that are in execution/verification/payment stages.
+    if (!['posted', 'shortlisted', 'applications_open', 'selection_in_progress'].includes(task.status)) {
+      return res.status(400).json({ error: 'Task cannot be deleted at the current status' });
+    }
+
+    // Cleanup dependent records to satisfy foreign-key constraints.
+    await query('DELETE FROM task_applications WHERE task_id = $1', [id]);
+    await query('DELETE FROM tasks WHERE id = $1', [id]);
+
+    return res.json({ message: 'Task deleted successfully' });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('[Tasks] Error deleting task:', errorMessage);
+    return res.status(500).json({ error: 'Failed to delete task' });
   }
 });
 

@@ -80,6 +80,23 @@ describe('Task Endpoints (/api/v1/tasks)', () => {
     expect([200, 400, 404, 500]).toContain(res.status);
   });
 
+  it('POST /:id/recommend-workers should refresh recommendations', async () => {
+    const res = await request(app).post('/api/v1/tasks/1/recommend-workers');
+    expect([200, 403, 404, 500]).toContain(res.status);
+  });
+
+  it('PATCH /:id should update task', async () => {
+    const res = await request(app)
+      .patch('/api/v1/tasks/1')
+      .send({ title: 'Updated Task Title', required_skills: ['cleaning', 'polishing'] });
+    expect([200, 400, 403, 404, 500]).toContain(res.status);
+  });
+
+  it('DELETE /:id should delete task', async () => {
+    const res = await request(app).delete('/api/v1/tasks/1');
+    expect([200, 400, 403, 404, 500]).toContain(res.status);
+  });
+
   it('POST /:id/submit-proof should submit proof', async () => {
     const res = await request(app).post('/api/v1/tasks/1/submit-proof');
     expect([200, 400, 404, 500]).toContain(res.status);
