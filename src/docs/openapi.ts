@@ -12,9 +12,13 @@ const openapiSpec = {
     },
   ],
   tags: [
-    { name: 'Health', description: 'Service health and availability checks' },
-    { name: 'Tasks', description: 'Task lifecycle operations' },
-    { name: 'Workers', description: 'Worker profiles and performance metrics' },
+    { name: 'Health', description: 'Service health checks' },
+    { name: 'Auth', description: 'Registration, login, JWT tokens' },
+    { name: 'Tasks', description: 'Task lifecycle — post, assign, verify (public)' },
+    { name: 'Buyer', description: 'Authenticated buyer operations (Bearer token required)' },
+    { name: 'Workers', description: 'Worker profiles and stats (public read)' },
+    { name: 'Worker Profile', description: 'Authenticated worker self-service — KYC, credit score, loans, insurance (Bearer token required)' },
+    { name: 'Admin', description: 'Admin-only management endpoints (Bearer token + admin role required)' },
     { name: 'Webhooks', description: 'Squad and verification webhook callbacks' },
     { name: 'Mock Squad', description: 'Local mock of Squad payment API (non-production only)' },
   ],
@@ -158,6 +162,71 @@ const openapiSpec = {
           error: { type: 'string', example: 'Task not found' },
         },
       },
+      AuthResponse: {
+        type: 'object',
+        properties: {
+          token: { type: 'string', example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...' },
+          user: { type: 'object', properties: {
+            id: { type: 'integer' }, email: { type: 'string' },
+            full_name: { type: 'string' }, role: { type: 'string', enum: ['buyer', 'worker', 'admin'] },
+            worker_id: { type: 'integer', nullable: true },
+          }},
+        },
+      },
+      CreditScore: {
+        type: 'object',
+        properties: {
+          worker_id: { type: 'integer' },
+          credit_score: { type: 'integer', example: 720, description: '0-850 FICO-inspired score' },
+          credit_band: { type: 'string', enum: ['poor', 'fair', 'good', 'very_good', 'exceptional'] },
+          tier: { type: 'string', enum: ['normal', 'verified'] },
+          loan_eligible: { type: 'boolean' },
+          insurance_eligible: { type: 'boolean' },
+          notes: { type: 'string' },
+        },
+      },
+      WorkerKyc: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          worker_id: { type: 'integer' },
+          status: { type: 'string', enum: ['pending', 'approved', 'rejected'] },
+          nin_submitted: { type: 'boolean' },
+          bvn_submitted: { type: 'boolean' },
+          address_submitted: { type: 'boolean' },
+          submitted_at: { type: 'string', format: 'date-time' },
+          reviewed_at: { type: 'string', format: 'date-time', nullable: true },
+          rejection_reason: { type: 'string', nullable: true },
+        },
+      },
+      WorkerLoan: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          worker_id: { type: 'integer' },
+          amount_naira: { type: 'number', example: 50000 },
+          purpose: { type: 'string', example: 'Equipment purchase' },
+          repayment_months: { type: 'integer', example: 6 },
+          credit_score_at_application: { type: 'integer' },
+          status: { type: 'string', enum: ['pending', 'approved', 'rejected', 'disbursed', 'repaid', 'defaulted'] },
+          created_at: { type: 'string', format: 'date-time' },
+        },
+      },
+      WorkerInsurance: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          worker_id: { type: 'integer' },
+          insurance_type: { type: 'string', enum: ['health', 'income_protection', 'accident'] },
+          coverage_amount_naira: { type: 'number', nullable: true },
+          status: { type: 'string', enum: ['pending', 'active', 'rejected', 'cancelled', 'expired'] },
+          expires_at: { type: 'string', format: 'date-time', nullable: true },
+          created_at: { type: 'string', format: 'date-time' },
+        },
+      },
+    },
+    securitySchemes: {
+      BearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
     },
     requestBodies: {
       CreateTaskRequest: {
@@ -811,24 +880,353 @@ const openapiSpec = {
       get: {
         tags: ['Webhooks'],
         summary: 'Check webhook service health',
+        responses: { 200: { description: 'Webhook service healthy' } },
+      },
+    },
+
+    // ── Auth ────────────────────────────────────────────────────────────────
+    '/api/v1/auth/register': {
+      post: {
+        tags: ['Auth'], summary: 'Register a new user',
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['email','password','full_name'], properties: {
+          email: { type: 'string', format: 'email' },
+          password: { type: 'string', minLength: 8 },
+          full_name: { type: 'string' },
+          phone: { type: 'string' },
+          role: { type: 'string', enum: ['buyer','worker'], default: 'buyer' },
+          worker_id: { type: 'integer', description: 'Link to existing worker profile (role=worker only)' },
+        }}}}},
         responses: {
-          200: {
-            description: 'Webhook service healthy',
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  properties: {
-                    status: { type: 'string', example: 'webhook service healthy' },
-                  },
-                },
-              },
-            },
-          },
+          201: { description: 'Registered', content: { 'application/json': { schema: { $ref: '#/components/schemas/AuthResponse' } } } },
+          409: { description: 'Email already registered' },
         },
       },
+    },
+    '/api/v1/auth/login': {
+      post: {
+        tags: ['Auth'], summary: 'Login and receive JWT',
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['email','password'], properties: {
+          email: { type: 'string' }, password: { type: 'string' },
+        }}}}},
+        responses: {
+          200: { description: 'Login successful', content: { 'application/json': { schema: { $ref: '#/components/schemas/AuthResponse' } } } },
+          401: { description: 'Invalid credentials' },
+        },
+      },
+    },
+
+    // ── Buyer ───────────────────────────────────────────────────────────────
+    '/api/v1/buyer/tasks': {
+      get: { tags: ['Buyer'], summary: 'List my tasks (with escrow status)', security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'Task list' }, 401: { description: 'Unauthorized' } } },
+      post: { tags: ['Buyer'], summary: 'Create a task and get AI worker matches', security: [{ BearerAuth: [] }],
+        requestBody: { $ref: '#/components/requestBodies/CreateTaskRequest' },
+        responses: { 201: { description: 'Task created with AI matches' }, 400: { description: 'Missing fields' } } },
+    },
+    '/api/v1/buyer/tasks/{id}': {
+      get: { tags: ['Buyer'], summary: 'Get my task by ID', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Task detail' }, 404: { description: 'Not found or not yours' } } },
+    },
+    '/api/v1/buyer/tasks/{id}/assign': {
+      post: { tags: ['Buyer'], summary: 'Assign worker → creates Squad escrow VA', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['worker_id'], properties: { worker_id: { type: 'integer' } } } } } },
+        responses: { 200: { description: 'Worker assigned, escrow VA created' } } },
+    },
+    '/api/v1/buyer/tasks/{id}/dispute': {
+      post: { tags: ['Buyer'], summary: 'File a dispute (during 24h window)', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'multipart/form-data': { schema: { type: 'object', required: ['reason'], properties: {
+          reason: { type: 'string' }, evidence: { type: 'array', items: { type: 'string', format: 'binary' } },
+        } } } } },
+        responses: { 200: { description: 'Dispute filed' }, 400: { description: 'Window expired or invalid state' } } },
+    },
+    '/api/v1/buyer/tasks/{id}/release-funds': {
+      post: { tags: ['Buyer'], summary: 'Manually release funds early (bypass 24h window)', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Funds released' } } },
+    },
+    '/api/v1/buyer/tasks/{id}/dispute-window': {
+      get: { tags: ['Buyer'], summary: 'Check remaining time in dispute window', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Window status with seconds_remaining' } } },
+    },
+    '/api/v1/buyer/disputes': {
+      get: { tags: ['Buyer'], summary: 'List all my filed disputes', security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'Dispute list' } } },
+    },
+
+    // ── Worker Profile (authenticated worker self-service) ───────────────────
+    '/api/v1/worker-profile/me': {
+      get: { tags: ['Worker Profile'], summary: 'My full worker profile + tier + credit score', security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'Worker profile with credit_score, credit_band, tier' } } },
+    },
+    '/api/v1/worker-profile/me/credit-score': {
+      get: { tags: ['Worker Profile'], summary: 'Detailed credit score breakdown and eligibility', security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'Credit score', content: { 'application/json': { schema: { $ref: '#/components/schemas/CreditScore' } } } } } },
+    },
+    '/api/v1/worker-profile/me/kyc': {
+      get: { tags: ['Worker Profile'], summary: 'Get my KYC status', security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'KYC record or {status: not_submitted}' } } },
+      post: {
+        tags: ['Worker Profile'], summary: 'Submit KYC (NIN + BVN + address)', security: [{ BearerAuth: [] }],
+        description: 'NIN and BVN are hashed (MD5) before storage. Both must be exactly 11 digits.',
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object',
+          required: ['nin','bvn','address_line1','city','state'],
+          properties: {
+            nin: { type: 'string', example: '12345678901', description: '11-digit National Identification Number' },
+            bvn: { type: 'string', example: '22345678901', description: '11-digit Bank Verification Number' },
+            address_line1: { type: 'string' }, address_line2: { type: 'string' },
+            city: { type: 'string' }, state: { type: 'string' }, country: { type: 'string', default: 'Nigeria' },
+          },
+        }}}},
+        responses: {
+          201: { description: 'KYC submitted, pending admin review' },
+          400: { description: 'Validation error' },
+          409: { description: 'KYC already pending or approved' },
+        },
+      },
+    },
+    '/api/v1/worker-profile/me/loans': {
+      get: { tags: ['Worker Profile'], summary: 'My loan applications', security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'Loan list', content: { 'application/json': { schema: { type: 'array', items: { $ref: '#/components/schemas/WorkerLoan' } } } } } } },
+      post: {
+        tags: ['Worker Profile'], summary: 'Apply for a loan (verified tier + credit score ≥580 required)', security: [{ BearerAuth: [] }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['amount_naira','purpose'], properties: {
+          amount_naira: { type: 'number', example: 50000 },
+          purpose: { type: 'string', example: 'Buy work equipment' },
+          repayment_months: { type: 'integer', default: 6 },
+        }}}}},
+        responses: {
+          201: { description: 'Loan application submitted' },
+          403: { description: 'Not verified or credit score too low' },
+          409: { description: 'Active loan already exists' },
+        },
+      },
+    },
+    '/api/v1/worker-profile/me/insurance': {
+      get: { tags: ['Worker Profile'], summary: 'My insurance policies', security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'Insurance list', content: { 'application/json': { schema: { type: 'array', items: { $ref: '#/components/schemas/WorkerInsurance' } } } } } } },
+      post: {
+        tags: ['Worker Profile'], summary: 'Apply for insurance (verified tier + credit score ≥580 required)', security: [{ BearerAuth: [] }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['insurance_type'], properties: {
+          insurance_type: { type: 'string', enum: ['health','income_protection','accident'] },
+          coverage_amount_naira: { type: 'number', example: 500000 },
+        }}}}},
+        responses: {
+          201: { description: 'Insurance application submitted' },
+          403: { description: 'Not verified or credit score too low' },
+          409: { description: 'Active policy of this type already exists' },
+        },
+      },
+    },
+
+    // ── Admin ───────────────────────────────────────────────────────────────
+    '/api/v1/admin/dashboard': {
+      get: { tags: ['Admin'], summary: 'Platform stats dashboard', security: [{ BearerAuth: [] }],
+        responses: { 200: { description: 'Aggregated platform metrics' } } },
+    },
+    '/api/v1/admin/users': {
+      get: { tags: ['Admin'], summary: 'List all users (paginated, filterable)', security: [{ BearerAuth: [] }],
+        parameters: [
+          { name: 'role', in: 'query', schema: { type: 'string', enum: ['admin','buyer','worker'] } },
+          { name: 'search', in: 'query', schema: { type: 'string' } },
+          { name: 'page', in: 'query', schema: { type: 'integer', default: 1 } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', default: 20 } },
+        ],
+        responses: { 200: { description: 'User list' } } },
+      post: { tags: ['Admin'], summary: 'Create a user (any role)', security: [{ BearerAuth: [] }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['email','password','full_name'], properties: {
+          email: { type: 'string' }, password: { type: 'string' }, full_name: { type: 'string' },
+          role: { type: 'string', enum: ['admin','buyer','worker'], default: 'buyer' },
+          worker_id: { type: 'integer' },
+        }}}}},
+        responses: { 201: { description: 'User created' }, 409: { description: 'Email exists' } } },
+    },
+    '/api/v1/admin/users/{id}': {
+      get: { tags: ['Admin'], summary: 'Get user by ID', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'User detail' }, 404: { description: 'Not found' } } },
+      patch: { tags: ['Admin'], summary: 'Update user (role, is_active, full_name, phone)', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: {
+          role: { type: 'string', enum: ['admin','buyer','worker'] }, is_active: { type: 'boolean' },
+          full_name: { type: 'string' }, phone: { type: 'string' },
+        }}}}},
+        responses: { 200: { description: 'Updated user' } } },
+      delete: { tags: ['Admin'], summary: 'Soft-deactivate user', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'User deactivated' } } },
+    },
+    '/api/v1/admin/tasks': {
+      get: { tags: ['Admin'], summary: 'All tasks with worker+buyer+escrow joined', security: [{ BearerAuth: [] }],
+        parameters: [
+          { name: 'status', in: 'query', schema: { type: 'string' } },
+          { name: 'page', in: 'query', schema: { type: 'integer', default: 1 } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', default: 20 } },
+        ],
+        responses: { 200: { description: 'Task list' } } },
+    },
+    '/api/v1/admin/tasks/{id}': {
+      get: { tags: ['Admin'], summary: 'Full task detail', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Task detail with escrow' } } },
+    },
+    '/api/v1/admin/tasks/{id}/status': {
+      patch: { tags: ['Admin'], summary: 'Force-set task status + resolution note', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['status'], properties: {
+          status: { type: 'string', enum: ['posted','assigned','funded','verified','completed','buyer_disputed','complaint_filed','disputed','cancelled','refunded'] },
+          admin_resolution: { type: 'string' },
+        }}}}},
+        responses: { 200: { description: 'Task updated' } } },
+    },
+    '/api/v1/admin/tasks/{id}/release-funds': {
+      post: { tags: ['Admin'], summary: 'Admin force-releases funds to worker', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Funds released' } } },
+    },
+    '/api/v1/admin/tasks/{id}/refund': {
+      post: { tags: ['Admin'], summary: 'Admin force-refunds buyer', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Buyer refunded' } } },
+    },
+    '/api/v1/admin/tasks/{id}/extend-dispute-window': {
+      post: { tags: ['Admin'], summary: 'Extend buyer dispute window', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: { hours: { type: 'integer', default: 24 } } } } } },
+        responses: { 200: { description: 'Window extended' } } },
+    },
+    '/api/v1/admin/disputes': {
+      get: { tags: ['Admin'], summary: 'List all disputes', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'status', in: 'query', schema: { type: 'string', enum: ['open','resolved_worker','resolved_buyer','escalated'] } }],
+        responses: { 200: { description: 'Dispute list' } } },
+    },
+    '/api/v1/admin/disputes/{id}': {
+      get: { tags: ['Admin'], summary: 'Dispute detail with proof + AI result', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Dispute detail' } } },
+    },
+    '/api/v1/admin/disputes/{id}/resolve': {
+      patch: { tags: ['Admin'], summary: 'Resolve dispute (resolved_worker → complete | resolved_buyer → refund)', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['resolution'], properties: {
+          resolution: { type: 'string', enum: ['resolved_worker','resolved_buyer','escalated'] },
+          resolution_note: { type: 'string' },
+        }}}}},
+        responses: { 200: { description: 'Dispute resolved' } } },
+    },
+    '/api/v1/admin/workers': {
+      get: { tags: ['Admin'], summary: 'All workers with trust scores and assigned_tasks count', security: [{ BearerAuth: [] }],
+        parameters: [
+          { name: 'search', in: 'query', schema: { type: 'string' } },
+          { name: 'is_active', in: 'query', schema: { type: 'boolean' } },
+        ],
+        responses: { 200: { description: 'Worker list' } } },
+    },
+    '/api/v1/admin/workers/{id}': {
+      patch: { tags: ['Admin'], summary: 'Update worker trust_score, is_active, skills, bio', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', properties: {
+          trust_score: { type: 'integer' }, is_active: { type: 'boolean' },
+          skills: { type: 'array', items: { type: 'string' } }, bio: { type: 'string' },
+        }}}}},
+        responses: { 200: { description: 'Worker updated' } } },
+    },
+    '/api/v1/admin/escrow': {
+      get: { tags: ['Admin'], summary: 'All escrow accounts', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'status', in: 'query', schema: { type: 'string', enum: ['pending','funded','released','refunded','frozen'] } }],
+        responses: { 200: { description: 'Escrow list' } } },
+    },
+    '/api/v1/admin/escrow/{id}/status': {
+      patch: { tags: ['Admin'], summary: 'Override escrow status', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['status'], properties: {
+          status: { type: 'string', enum: ['pending','funded','released','refunded','frozen'] },
+        }}}}},
+        responses: { 200: { description: 'Escrow updated' } } },
+    },
+    '/api/v1/admin/kyc': {
+      get: { tags: ['Admin'], summary: 'All KYC submissions', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'status', in: 'query', schema: { type: 'string', enum: ['pending','approved','rejected'] } }],
+        responses: { 200: { description: 'KYC list' } } },
+    },
+    '/api/v1/admin/kyc/{id}': {
+      get: { tags: ['Admin'], summary: 'KYC submission detail', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'KYC detail' } } },
+    },
+    '/api/v1/admin/kyc/{id}/review': {
+      patch: { tags: ['Admin'], summary: 'Approve or reject KYC. Approval upgrades worker tier to verified.', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['decision'], properties: {
+          decision: { type: 'string', enum: ['approved','rejected'] },
+          rejection_reason: { type: 'string', description: 'Required when decision=rejected' },
+        }}}}},
+        responses: { 200: { description: 'KYC reviewed. On approval, worker.tier set to verified.' } } },
+    },
+    '/api/v1/admin/loans': {
+      get: { tags: ['Admin'], summary: 'All loan applications', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'status', in: 'query', schema: { type: 'string', enum: ['pending','approved','rejected','disbursed','repaid','defaulted'] } }],
+        responses: { 200: { description: 'Loan list' } } },
+    },
+    '/api/v1/admin/loans/{id}': {
+      get: { tags: ['Admin'], summary: 'Loan detail', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Loan detail' } } },
+    },
+    '/api/v1/admin/loans/{id}/review': {
+      patch: { tags: ['Admin'], summary: 'Approve or reject loan application', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['decision'], properties: {
+          decision: { type: 'string', enum: ['approved','rejected'] },
+          admin_note: { type: 'string' }, rejection_reason: { type: 'string' },
+        }}}}},
+        responses: { 200: { description: 'Loan reviewed' } } },
+    },
+    '/api/v1/admin/loans/{id}/disburse': {
+      patch: { tags: ['Admin'], summary: 'Mark approved loan as disbursed', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Loan disbursed' }, 404: { description: 'Not found or not in approved state' } } },
+    },
+    '/api/v1/admin/insurance': {
+      get: { tags: ['Admin'], summary: 'All insurance applications', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'status', in: 'query', schema: { type: 'string', enum: ['pending','active','rejected','cancelled','expired'] } }],
+        responses: { 200: { description: 'Insurance list' } } },
+    },
+    '/api/v1/admin/insurance/{id}': {
+      get: { tags: ['Admin'], summary: 'Insurance detail', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        responses: { 200: { description: 'Insurance detail' } } },
+    },
+    '/api/v1/admin/insurance/{id}/review': {
+      patch: { tags: ['Admin'], summary: 'Approve (active) or reject insurance application', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+        requestBody: { required: true, content: { 'application/json': { schema: { type: 'object', required: ['decision'], properties: {
+          decision: { type: 'string', enum: ['active','rejected'] },
+          admin_note: { type: 'string' }, rejection_reason: { type: 'string' },
+          expires_at: { type: 'string', format: 'date-time', description: 'Default: 1 year from now' },
+        }}}}},
+        responses: { 200: { description: 'Insurance reviewed' } } },
+    },
+    '/api/v1/admin/ai-logs': {
+      get: { tags: ['Admin'], summary: 'Recent AI decision synthesis logs', security: [{ BearerAuth: [] }],
+        parameters: [{ name: 'limit', in: 'query', schema: { type: 'integer', default: 50 } }],
+        responses: { 200: { description: 'AI log entries' } } },
+    },
+    '/api/v1/admin/audit-logs': {
+      get: { tags: ['Admin'], summary: 'Paginated admin audit trail', security: [{ BearerAuth: [] }],
+        parameters: [
+          { name: 'actor_id', in: 'query', schema: { type: 'integer' } },
+          { name: 'action', in: 'query', schema: { type: 'string' } },
+          { name: 'entity_type', in: 'query', schema: { type: 'string' } },
+          { name: 'page', in: 'query', schema: { type: 'integer', default: 1 } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', default: 50 } },
+        ],
+        responses: { 200: { description: 'Audit log entries' } } },
     },
   },
 };
 
-export default openapiSpec;
+export default openapiSpec;

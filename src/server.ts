@@ -13,6 +13,10 @@ import taskRoutes from './routes/tasks';
 import workerRoutes from './routes/workers';
 import webhookRoutes from './routes/webhooks';
 import mockSquadRoutes from './routes/mock-squad';
+import authRoutes from './routes/auth';
+import buyerRoutes from './routes/buyer';
+import adminRoutes from './routes/admin';
+import workerProfileRoutes from './routes/worker-profile';
 
 // Add this to src/server.ts (or any route file)
 import { query } from './db/pool';
@@ -81,6 +85,10 @@ app.use('/api/docs', ...swaggerUi.serve, swaggerUi.setup(openapiSpec, {
 
 // API Routes
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+app.use('/api/v1/auth', authRoutes);
+app.use('/api/v1/buyer', buyerRoutes);
+app.use('/api/v1/admin', adminRoutes);
+app.use('/api/v1/worker-profile', workerProfileRoutes);
 app.use('/api/v1/tasks', taskRoutes);
 app.use('/api/v1/workers', workerRoutes);
 app.use('/api/v1/webhooks', webhookRoutes);

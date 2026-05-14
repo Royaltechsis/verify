@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getWorkerMatches, verifyTaskCompletion } from '../services/ai-matching';
 import { createSquadEscrow } from '../services/squad-service';
 import { processTaskOutcome } from '../services/financial-intelligence';
+
 import type { Task } from '../types';
 
 const router = Router();
@@ -187,14 +188,20 @@ router.post('/:id/submit-proof', upload.array('files', 3), async (req: Request, 
     const verification = await verifyTaskCompletion(parseInt(id, 10), proof_submission);
 
     // 2. Determine status based on AI review
-    // If pass -> 'verified'
+    // If pass -> 'verified' (24h dispute window opens)
     // If fail -> 'flagged_for_dispute'
     const status = verification.verified ? 'verified' : 'flagged_for_dispute';
 
+    // Set dispute window expiry (24 hours from verification)
+    const WINDOW_MS = process.env.NODE_ENV === 'test' ? 60_000 : 24 * 60 * 60 * 1000;
+    const disputeWindowExpires = new Date(Date.now() + WINDOW_MS);
+
     const result = await query(
-      `UPDATE tasks SET proof_submission = $1, submitted_at = NOW(), verified_at = NOW(), status = $2
-       WHERE id = $3 RETURNING *`,
-      [JSON.stringify(proof_submission), status, id]
+      `UPDATE tasks
+         SET proof_submission = $1, submitted_at = NOW(), verified_at = NOW(),
+             status = $2, dispute_window_expires = $3
+       WHERE id = $4 RETURNING *`,
+      [JSON.stringify(proof_submission), status, disputeWindowExpires, id]
     );
 
     if (result.rows.length === 0) {
@@ -203,32 +210,46 @@ router.post('/:id/submit-proof', upload.array('files', 3), async (req: Request, 
 
     const task = result.rows[0];
 
-    // 3. Initiate the payout window if AI passed the task
+    // 3. Initiate the automatic payout after the 24-hour dispute window
     if (status === 'verified') {
-      // The buyer has 24 hours to complain before payment automatically releases.
-      // To simulate it locally, we schedule a background completion using setTimeout.
-      // E.g., simulating 24 hours releasing funds via Squad
-      const MOCK_WAIT = process.env.NODE_ENV === 'test' ? 1000 : 24 * 60 * 60 * 1000;
       setTimeout(async () => {
         try {
-          // Verify it hasn't been challenged
-          const checkStatus = await query('SELECT status, assigned_worker_id, amount_naira FROM tasks WHERE id = $1', [id]);
-          if (checkStatus.rows.length > 0 && checkStatus.rows[0].status === 'verified') {
-            // No complaints within window -> Release Payment -> completed
-            await query(`UPDATE tasks SET status = 'completed', completed_at = NOW() WHERE id = $1`, [id]);
-            
-            // Process AI financial platform learning loop and profile updates
-            await processTaskOutcome(checkStatus.rows[0].assigned_worker_id, true, checkStatus.rows[0].amount_naira);
-            
-            console.log(`[Tasks] Payment released for task ${id}. Status = completed`);
+          // Only release if buyer has NOT disputed within the window
+          const checkStatus = await query(
+            'SELECT status, assigned_worker_id, amount_naira FROM tasks WHERE id = $1',
+            [id]
+          );
+          if (
+            checkStatus.rows.length > 0 &&
+            checkStatus.rows[0].status === 'verified'
+          ) {
+            // Window elapsed with no buyer dispute -> auto-release
+            await query(
+              `UPDATE tasks SET status = 'completed', completed_at = NOW() WHERE id = $1`,
+              [id]
+            );
+            await processTaskOutcome(
+              checkStatus.rows[0].assigned_worker_id,
+              true,
+              checkStatus.rows[0].amount_naira
+            );
+            console.log(`[Tasks] Auto-released payment for task ${id} after dispute window.`);
           }
         } catch (err) {
-          console.error(`[Tasks] Error releasing payment for task ${id}:`, err);
+          console.error(`[Tasks] Error auto-releasing payment for task ${id}:`, err);
         }
-      }, MOCK_WAIT);
+      }, WINDOW_MS);
     }
 
-    return res.json({ task, verification });
+    return res.json({
+      task,
+      verification,
+      dispute_window_expires: status === 'verified' ? disputeWindowExpires : null,
+      message:
+        status === 'verified'
+          ? 'AI verified. Buyer has 24 hours to dispute before funds are automatically released.'
+          : 'AI flagged. Worker can file a manual dispute.',
+    });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     console.error('[Tasks] Error submitting proof:', errorMessage);
@@ -236,7 +257,7 @@ router.post('/:id/submit-proof', upload.array('files', 3), async (req: Request, 
   }
 });
 
-// File a complaint over AI verification bounds
+// File a complaint over AI verification bounds (legacy – use /api/v1/buyer/tasks/:id/dispute for auth'd flow)
 router.post('/:id/complaint', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
@@ -244,9 +265,19 @@ router.post('/:id/complaint', async (req: Request, res: Response) => {
     const taskResult = await query('SELECT * FROM tasks WHERE id = $1', [id]);
     if (taskResult.rows.length === 0) return res.status(404).json({ error: 'Task not found' });
     
+    const task = taskResult.rows[0];
+
     // Only allow complaints when AI has verified (buyer has 24hrs)
-    if (taskResult.rows[0].status !== 'verified') {
+    if (task.status !== 'verified') {
       return res.status(400).json({ error: 'Task must be in verified state for complaint window' });
+    }
+
+    // Enforce the 24-hour window
+    if (task.dispute_window_expires && new Date() > new Date(task.dispute_window_expires)) {
+      return res.status(400).json({
+        error: 'Dispute window expired – funds have been auto-released to worker',
+        window_expired_at: task.dispute_window_expires,
+      });
     }
 
     const result = await query(
@@ -255,7 +286,7 @@ router.post('/:id/complaint', async (req: Request, res: Response) => {
     );
 
     // Apply penalty to the worker's economic profile
-    await processTaskOutcome(taskResult.rows[0].assigned_worker_id, false, 0);
+    await processTaskOutcome(task.assigned_worker_id, false, 0);
 
     return res.json({ message: 'Complaint registered for human intervention', task: result.rows[0] });
   } catch (error) {
