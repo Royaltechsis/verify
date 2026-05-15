@@ -76,9 +76,10 @@ const buildTaskAccessClause = (user: Request['user'], params: any[]): string => 
     if (!user.worker_id) {
       return ' AND 1=0';
     }
-    // Push worker_id once and reuse the same parameter index for all 4 predicates
+    // Push worker_id once and reuse the same parameter index for predicates that reference it
     params.push(user.worker_id);
     const workerIdParam = params.length;
+    // Allow workers to view tasks they're associated with OR tasks that are publicly open for applications
     return `
       AND (
         t.assigned_worker_id = $${workerIdParam}
@@ -89,6 +90,7 @@ const buildTaskAccessClause = (user: Request['user'], params: any[]): string => 
           FROM task_applications ta
           WHERE ta.task_id = t.id AND ta.worker_id = $${workerIdParam}
         )
+        OR t.status IN ('posted', 'applications_open')
       )
     `;
   }
@@ -497,10 +499,9 @@ router.post('/:id/apply', authenticate, requireRole('worker'), async (req: Reque
     }
 
     const task = taskResult.rows[0];
-    const shortlistedWorkers = task.shortlisted_workers || [];
-    
-    if (!shortlistedWorkers.includes(worker_id)) {
-      return res.status(403).json({ error: 'Worker is not shortlisted for this task' });
+    // Allow any worker to apply for tasks that are open for applications
+    if (!['posted', 'shortlisted', 'applications_open'].includes(task.status)) {
+      return res.status(400).json({ error: 'Task is not open for applications' });
     }
 
     const result = await query(

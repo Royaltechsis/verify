@@ -63,7 +63,11 @@ export class WalletService {
     try {
       const wallet = await this.getWallet(userId, userType);
       
-      if (wallet.balance < amount) {
+      // Convert to numbers to handle PostgreSQL numeric type (comes as string)
+      const balance = parseFloat(String(wallet.balance));
+      const requestAmount = parseFloat(String(amount));
+      
+      if (balance < requestAmount) {
         throw new Error('Insufficient wallet balance to fund this task');
       }
       
@@ -101,7 +105,11 @@ export class WalletService {
       const buyerWallet = await this.getWallet(buyerId, 'buyer');
       const workerWallet = await this.getWallet(workerId, 'worker');
       
-      if (buyerWallet.locked_balance < amount) {
+      // Convert to numbers to handle PostgreSQL numeric type (comes as string)
+      const lockedBalance = parseFloat(String(buyerWallet.locked_balance));
+      const requestAmount = parseFloat(String(amount));
+      
+      if (lockedBalance < requestAmount) {
         throw new Error('Insufficient locked balance to release');
       }
       
@@ -154,7 +162,11 @@ export class WalletService {
     try {
       const wallet = await this.getWallet(userId, userType);
       
-      if (wallet.balance < amount) {
+      // Convert to numbers to handle PostgreSQL numeric type (comes as string)
+      const balance = parseFloat(String(wallet.balance));
+      const requestAmount = parseFloat(String(amount));
+      
+      if (balance < requestAmount) {
         throw new Error('Insufficient wallet balance');
       }
       

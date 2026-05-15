@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { authenticate } from '../middleware/auth';
+import { authenticate, requireRole } from '../middleware/auth';
 import { WalletService } from '../services/wallet-service';
 import { createSquadEscrow } from '../services/squad-service';
 import { query } from '../db/pool';
@@ -85,6 +85,29 @@ router.post('/withdraw', authenticate, async (req: Request, res: Response): Prom
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     return res.status(400).json({ error: 'Withdrawal failed', details: errorMessage });
+  }
+});
+
+// Admin: Manually deposit funds to wallet (dev/testing when Squad is down)
+router.post('/deposit', authenticate, requireRole('admin'), async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { wallet_id, amount, reference } = req.body;
+    
+    if (!wallet_id || !amount || amount <= 0) {
+      return res.status(400).json({ error: 'wallet_id and amount (> 0) are required' });
+    }
+    
+    const ref = reference || `MANUAL_DEPOSIT_${Date.now()}`;
+    const updatedWallet = await WalletService.fundWallet(wallet_id, amount, ref);
+    
+    return res.json({ 
+      success: true, 
+      wallet: updatedWallet, 
+      message: `Deposited ₦${amount} to wallet ${wallet_id}` 
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    return res.status(400).json({ error: 'Deposit failed', details: errorMessage });
   }
 });
 
