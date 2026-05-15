@@ -202,6 +202,50 @@ router.get('/me/credit-score', async (req: Request, res: Response) => {
   }
 });
 
+// ─── PATCH /api/v1/worker-profile/me ────────────────────────────────────────
+// Update editable fields on the worker profile (workers update their own profile)
+router.patch('/me', async (req: Request, res: Response) => {
+  try {
+    const worker = await resolveWorker(req, res);
+    if (!worker) return;
+
+    const allowed = ['name', 'phone', 'skills', 'bio', 'primary_location', 'latitude', 'longitude', 'avatar_url'];
+    const updates: string[] = [];
+    const values: any[] = [];
+
+    allowed.forEach((field) => {
+      if (Object.prototype.hasOwnProperty.call(req.body, field)) {
+        values.push((req.body as any)[field]);
+        updates.push(`${field} = $${values.length}`);
+      }
+    });
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No editable fields provided' });
+    }
+
+    // Append updated_at
+    values.push(new Date());
+    const setClause = updates.join(', ') + `, updated_at = $${values.length}`;
+
+    const result = await query(
+      `UPDATE workers SET ${setClause} WHERE id = $${values.length + 1} RETURNING *`,
+      [...values, worker.id]
+    );
+
+    const updated = result.rows[0];
+
+    await auditLog(req.user!.id, req.user!.role, 'update_worker_profile', 'workers', updated.id, {
+      updated_fields: updates.map(u => u.split(' = ')[0])
+    });
+
+    return res.json({ message: 'Profile updated', worker: updated });
+  } catch (err: any) {
+    console.error('[WorkerProfile] Update error:', err.message);
+    return res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // KYC
 // ══════════════════════════════════════════════════════════════════════════════

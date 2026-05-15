@@ -63,7 +63,7 @@ export class WalletService {
     try {
       const wallet = await this.getWallet(userId, userType);
       
-      // Convert to numbers to handle PostgreSQL numeric type (comes as string)
+    // Convert to numbers to handle PostgreSQL numeric type (comes as string)
       const balance = parseFloat(String(wallet.balance));
       const requestAmount = parseFloat(String(amount));
       
