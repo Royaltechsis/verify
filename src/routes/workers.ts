@@ -10,7 +10,10 @@ router.get('/', async (req: Request, res: Response) => {
     const skill = req.query.skill as string;
     const minRating = req.query.minRating as string;
 
-    let sql = 'SELECT * FROM workers WHERE is_active = true';
+    let sql = `SELECT w.*, u.id AS linked_user_id
+           FROM workers w
+           LEFT JOIN users u ON u.worker_id = w.id
+           WHERE w.is_active = true`;
     const params: any[] = [];
 
     if (location) {
@@ -28,7 +31,7 @@ router.get('/', async (req: Request, res: Response) => {
       params.push(parseFloat(minRating));
     }
 
-    sql += ' ORDER BY trust_score DESC';
+    sql += ' ORDER BY w.trust_score DESC';
     const result = await query(sql, params);
     return res.json(result.rows);
   } catch (error) {
@@ -42,7 +45,13 @@ router.get('/', async (req: Request, res: Response) => {
 router.get('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const result = await query('SELECT * FROM workers WHERE id = $1', [id]);
+    const result = await query(
+      `SELECT w.*, u.id AS linked_user_id
+       FROM workers w
+       LEFT JOIN users u ON u.worker_id = w.id
+       WHERE w.id = $1`,
+      [id]
+    );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Worker not found' });

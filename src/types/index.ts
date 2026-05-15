@@ -5,6 +5,7 @@
 export interface Worker {
   id: number;
   external_id?: string;
+  linked_user_id?: number;
   name: string;
   email: string;
   phone?: string;
@@ -113,4 +114,16 @@ export interface SquadWebhookEvent {
   data: any;
   reference: string;
   timestamp: string;
+}
+
+export interface Message {
+  id: number;
+  sender_user_id: number;
+  recipient_user_id: number;
+  task_id?: number;
+  body: string;
+  is_read: boolean;
+  read_at?: string;
+  created_at: string;
+  updated_at?: string;
 }

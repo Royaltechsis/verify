@@ -19,6 +19,7 @@ import adminRoutes from './routes/admin';
 import workerProfileRoutes from './routes/worker-profile';
 import walletRoutes from './routes/wallet';
 import notificationRoutes from './routes/notifications';
+import messageRoutes from './routes/messages';
 
 // Add this to src/server.ts (or any route file)
 import { query } from './db/pool';
@@ -96,6 +97,7 @@ app.use('/api/v1/workers', workerRoutes);
 app.use('/api/v1/webhooks', webhookRoutes);
 app.use('/api/v1/wallet', walletRoutes);
 app.use('/api/v1/notifications', notificationRoutes);
+app.use('/api/v1/messages', messageRoutes);
 
 // Mount Mock Squad API for testing
 if (process.env.NODE_ENV !== 'production') {

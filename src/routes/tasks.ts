@@ -724,6 +724,16 @@ router.post('/:id/submit-proof', authenticate, requireRole('worker'), upload.arr
 
     // 1. Submit proof & Run AI verification
     const verification = await verifyTaskCompletion(parseInt(id, 10), proof_submission);
+    const verificationMessage = verification.verified
+      ? 'AI verified. Buyer has 24 hours to dispute before funds are automatically released.'
+      : 'AI flagged. Worker can file a manual dispute.';
+
+    const aiVerificationResult = {
+      ...verification,
+      message: verificationMessage,
+      proof_submission,
+      submitted_at: new Date().toISOString(),
+    };
 
     // 2. Determine status based on AI review
     // If pass -> 'verified' (24h dispute window opens)
@@ -736,10 +746,20 @@ router.post('/:id/submit-proof', authenticate, requireRole('worker'), upload.arr
 
     const result = await query(
       `UPDATE tasks
-         SET proof_submission = $1, submitted_at = NOW(), verified_at = NOW(),
-             status = $2, dispute_window_expires = $3
-       WHERE id = $4 RETURNING *`,
-      [JSON.stringify(proof_submission), status, disputeWindowExpires, id]
+         SET proof_submission = $1,
+             ai_verification_result = $2,
+             submitted_at = NOW(),
+             verified_at = NOW(),
+             status = $3,
+             dispute_window_expires = $4
+       WHERE id = $5 RETURNING *`,
+      [
+        JSON.stringify(proof_submission),
+        JSON.stringify(aiVerificationResult),
+        status,
+        disputeWindowExpires,
+        id,
+      ]
     );
 
     if (result.rows.length === 0) {
@@ -829,10 +849,7 @@ router.post('/:id/submit-proof', authenticate, requireRole('worker'), upload.arr
       task,
       verification,
       dispute_window_expires: status === 'verified' ? disputeWindowExpires : null,
-      message:
-        status === 'verified'
-          ? 'AI verified. Buyer has 24 hours to dispute before funds are automatically released.'
-          : 'AI flagged. Worker can file a manual dispute.',
+      message: verificationMessage,
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -915,7 +932,7 @@ router.get('/:id/status', authenticate, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const result = await query(
-      'SELECT id, status, assigned_worker_id, submitted_at, verified_at FROM tasks WHERE id = $1',
+      'SELECT id, status, assigned_worker_id, submitted_at, verified_at, ai_verification_result FROM tasks WHERE id = $1',
       [id]
     );
 
