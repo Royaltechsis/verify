@@ -224,9 +224,98 @@ function extractJSON(raw: string): string {
   let s = raw.trim();
   const fenced = s.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenced) s = fenced[1].trim();
-  const obj = s.match(/\{[\s\S]*\}/);
-  if (obj) s = obj[0];
+  const start = s.indexOf('{');
+  if (start >= 0) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = start; i < s.length; i++) {
+      const ch = s[i];
+
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === '\\') {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (ch === '"') {
+        inString = true;
+      } else if (ch === '{') {
+        depth++;
+      } else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          return s.slice(start, i + 1);
+        }
+      }
+    }
+  }
   return s;
+}
+
+function repairJsonText(raw: string): string {
+  let repaired = '';
+  let inString = false;
+  let escaped = false;
+
+  for (const ch of raw) {
+    if (inString) {
+      if (escaped) {
+        repaired += ch;
+        escaped = false;
+        continue;
+      }
+
+      if (ch === '\\') {
+        repaired += ch;
+        escaped = true;
+        continue;
+      }
+
+      if (ch === '"') {
+        repaired += ch;
+        inString = false;
+        continue;
+      }
+
+      if (ch === '\n') {
+        repaired += '\\n';
+        continue;
+      }
+
+      if (ch === '\r') {
+        repaired += '\\r';
+        continue;
+      }
+
+      if (ch === '\t') {
+        repaired += '\\t';
+        continue;
+      }
+    } else if (ch === '"') {
+      inString = true;
+    }
+
+    repaired += ch;
+  }
+
+  return repaired.replace(/,\s*([}\]])/g, '$1');
+}
+
+function parseModelJson<T>(raw: string): T {
+  const extracted = extractJSON(raw);
+  try {
+    return JSON.parse(extracted);
+  } catch (firstError) {
+    const repaired = repairJsonText(extracted);
+    return JSON.parse(repaired);
+  }
 }
 
 // ─── 1. Worker Matching Synthesizer ─────────────────────────────────────────
@@ -265,7 +354,7 @@ Return this exact JSON shape:
 
   try {
     const raw = await callLLM(MATCHING_SYSTEM, userPrompt);
-    const synthesized: SynthesisOutput = JSON.parse(extractJSON(raw));
+    const synthesized: SynthesisOutput = parseModelJson<SynthesisOutput>(raw);
     const topWorker = synthesized.recommended_workers?.[0];
     console.log(`[DecisionSynthesizer] Matched → worker ${topWorker?.worker_id} (confidence: ${topWorker?.confidence})`);
     await logSynthesisDecision('matching', input, synthesized);
@@ -339,7 +428,7 @@ Guidelines:
     }
 
     const raw = await callLLM(VERIFICATION_SYSTEM, userPrompt, imageUrls);
-    const result: ProofVerificationOutput = JSON.parse(extractJSON(raw));
+    const result: ProofVerificationOutput = parseModelJson<ProofVerificationOutput>(raw);
     console.log(`[DecisionSynthesizer] Proof verification → verified=${result.verified} confidence=${result.confidence}`);
     await logSynthesisDecision('verification', input, result);
     return result;
