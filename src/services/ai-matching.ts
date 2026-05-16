@@ -33,6 +33,8 @@ interface MatchResult {
   match_score: number;
   rank?: number;
   recommendation_reason?: string;
+  tradeoff_note?: string;
+  use_case_tags?: string[];
   strengths?: string[];
   risks?: string[];
   confidence?: number;
@@ -135,6 +137,8 @@ async function getWorkerMatches(task: Task, limit: number = 5): Promise<MatchRes
         distance_km: Math.round(ec.distance * 100) / 100,
         rank: r.rank,
         recommendation_reason: r.recommendation_reason,
+        tradeoff_note: (r as any).tradeoff_note,
+        use_case_tags: (r as any).use_case_tags,
         strengths: r.strengths,
         risks: r.risks,
         confidence: r.confidence
@@ -147,6 +151,8 @@ async function getWorkerMatches(task: Task, limit: number = 5): Promise<MatchRes
       match_score: ec.candidateData.match_score,
       distance_km: Math.round(ec.distance * 100) / 100,
       recommendation_reason: "Fallback candidate from deterministic engine.",
+      tradeoff_note: "Deterministic fallback: validate trust and risk before assignment.",
+      use_case_tags: ['best_skill_fit'],
       risks: ["AI synthesis unavailable"]
     }));
   } catch (error) {

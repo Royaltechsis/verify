@@ -46,12 +46,19 @@ export interface SynthesisOutput {
     rank: number;
     score: number;
     recommendation_reason: string;
+    tradeoff_note: string;
+    use_case_tags: string[];
     strengths: string[];
     risks: string[];
     confidence: number;
   }>;
   summary: string;
   selection_strategy: string;
+  scenario_recommendations?: Array<{
+    use_case: string;
+    preferred_worker_id: string;
+    why: string;
+  }>;
 }
 
 export interface ProofVerificationInput {
@@ -78,7 +85,13 @@ export interface ProofVerificationOutput {
 
 // ─── Core LLM call ──────────────────────────────────────────────────────────
 
-async function callGemini(systemInstruction: string, userPrompt: string, imageUrls: string[] = [], retryOnRateLimit = true): Promise<string> {
+async function callGemini(
+  systemInstruction: string,
+  userPrompt: string,
+  imageUrls: string[] = [],
+  retryOnRateLimit = true,
+  responseSchema?: any
+): Promise<string> {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not set');
   }
@@ -138,7 +151,8 @@ async function callGemini(systemInstruction: string, userPrompt: string, imageUr
     generationConfig: {
       responseMimeType: 'application/json',
       temperature: 0.1,
-      maxOutputTokens: 2048  // 1024 was too small for multi-candidate matching responses
+      maxOutputTokens: 4096,  // more headroom to reduce truncated JSON responses
+      ...(responseSchema ? { responseSchema } : {})
     }
   };
 
@@ -155,7 +169,7 @@ async function callGemini(systemInstruction: string, userPrompt: string, imageUr
     const delayMs = retryDelay ? parseInt(retryDelay) * 1000 : 15000;
     console.warn(`[DecisionSynthesizer] ${res.status} — retrying in ${delayMs / 1000}s ...`);
     await new Promise(r => setTimeout(r, delayMs));
-    return callGemini(systemInstruction, userPrompt, imageUrls, false); // no second retry
+    return callGemini(systemInstruction, userPrompt, imageUrls, false, responseSchema); // no second retry
   }
 
   if (!res.ok) {
@@ -170,9 +184,9 @@ async function callGemini(systemInstruction: string, userPrompt: string, imageUr
 }
 
 /** Fallback: tries Groq or OpenRouter if Gemini key not present */
-async function callLLM(systemInstruction: string, userPrompt: string, imageUrls: string[] = []): Promise<string> {
+async function callLLM(systemInstruction: string, userPrompt: string, imageUrls: string[] = [], responseSchema?: any): Promise<string> {
   if (process.env.GEMINI_API_KEY) {
-    return callGemini(systemInstruction, userPrompt, imageUrls);
+    return callGemini(systemInstruction, userPrompt, imageUrls, true, responseSchema);
   }
 
   if (process.env.GROQ_API_KEY) {
@@ -321,6 +335,9 @@ function isSynthesisOutput(value: any): value is SynthesisOutput {
     typeof worker.rank === 'number' &&
     typeof worker.score === 'number' &&
     typeof worker.recommendation_reason === 'string' &&
+    typeof worker.tradeoff_note === 'string' &&
+    Array.isArray(worker.use_case_tags) &&
+    worker.use_case_tags.every((t: any) => typeof t === 'string') &&
     Array.isArray(worker.strengths) &&
     worker.strengths.every((s: any) => typeof s === 'string') &&
     Array.isArray(worker.risks) &&
@@ -370,10 +387,63 @@ Rules:
 - Do NOT alter or invent scores; base ranking strictly on the provided metrics and profiles (especially credit_score, risk_level, and behavioral_score).
 - Return pure JSON, no markdown, no explanation outside the JSON structure.
 - Provide a summary and a selection_strategy.
-- Return top 3-5 candidates in recommended_workers array, each containing: rank, score, recommendation_reason, strengths, risks, confidence.`;
+- Prioritize skill fit in ranking, but explicitly call out trust/risk tradeoffs.
+- Return top 3-5 candidates in recommended_workers array, each containing: rank, score, recommendation_reason, tradeoff_note, use_case_tags, strengths, risks, confidence.
+- tradeoff_note must clearly state tradeoffs like: "strong skill match but lower trust score" when applicable.
+- include scenario_recommendations for other use-cases (e.g., best_skill_fit, safest_option, nearest_worker, budget_sensitive).`;
+
+const MATCHING_RESPONSE_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    recommended_workers: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          worker_id: { type: 'STRING' },
+          rank: { type: 'NUMBER' },
+          score: { type: 'NUMBER' },
+          recommendation_reason: { type: 'STRING' },
+          tradeoff_note: { type: 'STRING' },
+          use_case_tags: { type: 'ARRAY', items: { type: 'STRING' } },
+          strengths: { type: 'ARRAY', items: { type: 'STRING' } },
+          risks: { type: 'ARRAY', items: { type: 'STRING' } },
+          confidence: { type: 'NUMBER' }
+        },
+        required: ['worker_id', 'rank', 'score', 'recommendation_reason', 'tradeoff_note', 'use_case_tags', 'strengths', 'risks', 'confidence']
+      }
+    },
+    summary: { type: 'STRING' },
+    selection_strategy: { type: 'STRING' },
+    scenario_recommendations: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          use_case: { type: 'STRING' },
+          preferred_worker_id: { type: 'STRING' },
+          why: { type: 'STRING' }
+        },
+        required: ['use_case', 'preferred_worker_id', 'why']
+      }
+    }
+  },
+  required: ['recommended_workers', 'summary', 'selection_strategy']
+};
+
+const VERIFICATION_RESPONSE_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    verified: { type: 'BOOLEAN' },
+    confidence: { type: 'NUMBER' },
+    details: { type: 'STRING' },
+    flags: { type: 'ARRAY', items: { type: 'STRING' } }
+  },
+  required: ['verified', 'confidence', 'details', 'flags']
+};
 
 export async function synthesizeDecision(input: SynthesisInput): Promise<SynthesisOutput> {
-  const userPrompt = `Task:
+  const basePrompt = `Task:
 ${JSON.stringify(input.task, null, 2)}
 
 Candidates (from deterministic engines):
@@ -387,18 +457,39 @@ Return this exact JSON shape:
       "rank": <number>,
       "score": <number>,
       "recommendation_reason": "<sentence>",
+      "tradeoff_note": "<example: strong skill match but lower trust score>",
+      "use_case_tags": ["<best_skill_fit|safest_option|nearest_worker|budget_sensitive>"],
       "strengths": ["<strength 1>"],
       "risks": ["<risk 1>"],
       "confidence": <0-100>
     }
   ],
   "summary": "<overall summary of candidates>",
-  "selection_strategy": "<advice for the buyer on how to choose>"
+  "selection_strategy": "<advice for the buyer on how to choose>",
+  "scenario_recommendations": [
+    {
+      "use_case": "best_skill_fit",
+      "preferred_worker_id": "<string>",
+      "why": "<brief reason>"
+    },
+    {
+      "use_case": "safest_option",
+      "preferred_worker_id": "<string>",
+      "why": "<brief reason>"
+    }
+  ]
 }`;
 
   try {
-    const raw = await callLLM(MATCHING_SYSTEM, userPrompt);
-    const synthesized: SynthesisOutput = parseModelJson<SynthesisOutput>(raw, isSynthesisOutput, 'Matching synthesis');
+    const raw = await callLLM(MATCHING_SYSTEM, basePrompt, [], MATCHING_RESPONSE_SCHEMA);
+    let synthesized: SynthesisOutput;
+    try {
+      synthesized = parseModelJson<SynthesisOutput>(raw, isSynthesisOutput, 'Matching synthesis');
+    } catch {
+      const compactPrompt = `${basePrompt}\n\nIMPORTANT: keep recommendation_reason under 120 characters, avoid quotes inside recommendation_reason, and return minified valid JSON only.`;
+      const retryRaw = await callLLM(MATCHING_SYSTEM, compactPrompt, [], MATCHING_RESPONSE_SCHEMA);
+      synthesized = parseModelJson<SynthesisOutput>(retryRaw, isSynthesisOutput, 'Matching synthesis retry');
+    }
     const topWorker = synthesized.recommended_workers?.[0];
     console.log(`[DecisionSynthesizer] Matched → worker ${topWorker?.worker_id} (confidence: ${topWorker?.confidence})`);
     await logSynthesisDecision('matching', input, synthesized);
@@ -413,12 +504,23 @@ Return this exact JSON shape:
         rank: idx + 1,
         score: c.match_score,
         recommendation_reason: 'Fallback to deterministic engine scores (AI synthesis unavailable).',
+        tradeoff_note: 'Ranked by score; verify trust score and risk before assigning.',
+        use_case_tags: ['best_skill_fit', 'safest_option'],
         strengths: [],
         risks: ['AI synthesis unavailable — manual review recommended.'],
         confidence: 100
       })),
       summary: "Deterministic engine fallback.",
-      selection_strategy: "Manual review of deterministic rankings."
+      selection_strategy: "Prioritize skill fit first, then screen trust/risk before final assignment.",
+      scenario_recommendations: sorted.slice(0, 3).map((candidate, index) => ({
+        use_case: index === 0 ? 'best_skill_fit' : index === 1 ? 'safest_option' : 'nearest_worker',
+        preferred_worker_id: candidate.worker_id.toString(),
+        why: index === 0
+          ? 'Highest deterministic match score.'
+          : index === 1
+          ? 'Strong alternative for risk-balanced selection.'
+          : 'Useful fallback when location/time matters.'
+      }))
     };
 
     await logSynthesisDecision('matching', input, fallback);
@@ -471,7 +573,7 @@ Guidelines:
       imageUrls = [input.proof.fileUrl];
     }
 
-    const raw = await callLLM(VERIFICATION_SYSTEM, userPrompt, imageUrls);
+    const raw = await callLLM(VERIFICATION_SYSTEM, userPrompt, imageUrls, VERIFICATION_RESPONSE_SCHEMA);
   const result: ProofVerificationOutput = parseModelJson<ProofVerificationOutput>(raw, isProofVerificationOutput, 'Proof verification');
     console.log(`[DecisionSynthesizer] Proof verification → verified=${result.verified} confidence=${result.confidence}`);
     await logSynthesisDecision('verification', input, result);
