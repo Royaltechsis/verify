@@ -308,13 +308,57 @@ function repairJsonText(raw: string): string {
   return repaired.replace(/,\s*([}\]])/g, '$1');
 }
 
-function parseModelJson<T>(raw: string): T {
+function isSynthesisOutput(value: any): value is SynthesisOutput {
+  if (!value || typeof value !== 'object') return false;
+  if (!Array.isArray(value.recommended_workers)) return false;
+  if (typeof value.summary !== 'string') return false;
+  if (typeof value.selection_strategy !== 'string') return false;
+
+  return value.recommended_workers.every((worker: any) => (
+    worker &&
+    typeof worker === 'object' &&
+    (typeof worker.worker_id === 'string' || typeof worker.worker_id === 'number') &&
+    typeof worker.rank === 'number' &&
+    typeof worker.score === 'number' &&
+    typeof worker.recommendation_reason === 'string' &&
+    Array.isArray(worker.strengths) &&
+    worker.strengths.every((s: any) => typeof s === 'string') &&
+    Array.isArray(worker.risks) &&
+    worker.risks.every((r: any) => typeof r === 'string') &&
+    typeof worker.confidence === 'number'
+  ));
+}
+
+function isProofVerificationOutput(value: any): value is ProofVerificationOutput {
+  if (!value || typeof value !== 'object') return false;
+  if (typeof value.verified !== 'boolean') return false;
+  if (typeof value.confidence !== 'number') return false;
+  if (typeof value.details !== 'string') return false;
+  if (!Array.isArray(value.flags)) return false;
+  return value.flags.every((flag: any) => typeof flag === 'string');
+}
+
+function parseModelJson<T>(raw: string, validator?: (value: any) => boolean, kind?: string): T {
   const extracted = extractJSON(raw);
   try {
-    return JSON.parse(extracted);
+    const parsed = JSON.parse(extracted);
+    if (validator && !validator(parsed)) {
+      throw new Error(`${kind || 'Model output'} JSON shape validation failed`);
+    }
+    return parsed;
   } catch (firstError) {
-    const repaired = repairJsonText(extracted);
-    return JSON.parse(repaired);
+    try {
+      const repaired = repairJsonText(extracted);
+      const parsed = JSON.parse(repaired);
+      if (validator && !validator(parsed)) {
+        throw new Error(`${kind || 'Model output'} JSON shape validation failed after repair`);
+      }
+      return parsed;
+    } catch (secondError: any) {
+      const snippet = extracted.slice(0, 500).replace(/\s+/g, ' ');
+      const reason = secondError?.message || firstError;
+      throw new Error(`${kind || 'Model output'} parse failed: ${reason}. raw_snippet="${snippet}"`);
+    }
   }
 }
 
@@ -354,7 +398,7 @@ Return this exact JSON shape:
 
   try {
     const raw = await callLLM(MATCHING_SYSTEM, userPrompt);
-    const synthesized: SynthesisOutput = parseModelJson<SynthesisOutput>(raw);
+    const synthesized: SynthesisOutput = parseModelJson<SynthesisOutput>(raw, isSynthesisOutput, 'Matching synthesis');
     const topWorker = synthesized.recommended_workers?.[0];
     console.log(`[DecisionSynthesizer] Matched → worker ${topWorker?.worker_id} (confidence: ${topWorker?.confidence})`);
     await logSynthesisDecision('matching', input, synthesized);
@@ -428,7 +472,7 @@ Guidelines:
     }
 
     const raw = await callLLM(VERIFICATION_SYSTEM, userPrompt, imageUrls);
-    const result: ProofVerificationOutput = parseModelJson<ProofVerificationOutput>(raw);
+  const result: ProofVerificationOutput = parseModelJson<ProofVerificationOutput>(raw, isProofVerificationOutput, 'Proof verification');
     console.log(`[DecisionSynthesizer] Proof verification → verified=${result.verified} confidence=${result.confidence}`);
     await logSynthesisDecision('verification', input, result);
     return result;
